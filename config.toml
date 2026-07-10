@@ -1,0 +1,35 @@
+# whisper-flow configuration
+# Hold the hotkey, speak, release — cleaned-up text is pasted at your cursor.
+
+[hotkey]
+# Which key to hold while talking. Options: "alt_r" (Right-Option, default),
+# "cmd_r" (Right-Command), "ctrl_r" (Right-Control), "f13".
+key = "alt_r"
+
+[audio]
+# Recordings shorter than this are discarded (accidental taps).
+min_duration_s = 0.3
+# Recordings are force-stopped after this many seconds.
+max_duration_s = 120
+
+[stt]
+# "parakeet" (recommended, fast + multilingual) or "whisper" (requires: pip install mlx-whisper)
+engine = "parakeet"
+parakeet_model = "mlx-community/parakeet-tdt-0.6b-v3"
+whisper_model = "mlx-community/whisper-large-v3-turbo"
+
+[cleanup]
+# LLM cleanup of the raw transcript (removes filler words, fixes punctuation).
+# Requires an Anthropic API key in the Keychain or ANTHROPIC_API_KEY env var:
+#   security add-generic-password -s whisper-flow -a anthropic -w YOUR_KEY
+enabled = true
+model = "claude-haiku-4-5"
+# Skip cleanup for transcripts shorter than this many words.
+min_words = 4
+# Give up on cleanup after this many seconds and paste the raw transcript.
+timeout_s = 5.0
+
+[insert]
+# "paste" (clipboard + Cmd+V, works almost everywhere) or "type" (simulated
+# keystrokes, slower but works in apps that block programmatic paste).
+mode = "paste"
