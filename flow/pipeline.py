@@ -34,19 +34,24 @@ class Pipeline:
         self._lock = threading.Lock()
 
     def start(self):
-        threading.Thread(target=self._load_model, daemon=True).start()
+        # Load, warm up, and run the model all on the single worker thread.
+        # MLX streams are thread-local, so the model must be used on the same
+        # thread it was created on — otherwise generate() raises
+        # "There is no Stream(cpu, N) in current thread".
         threading.Thread(target=self._worker, daemon=True).start()
 
-    def _load_model(self):
+    def _load_model(self) -> bool:
         self.set_state("loading")
         try:
             self.engine = stt.create_engine(self.cfg)
             self.engine.warmup()
             self.set_state("idle")
             log.info("Engine ready")
+            return True
         except Exception:
             log.exception("Failed to load STT engine")
             self.set_state("error")
+            return False
 
     # -- hotkey callbacks (run on the pynput listener thread) --
 
@@ -103,6 +108,8 @@ class Pipeline:
     # -- worker --
 
     def _worker(self):
+        if not self._load_model():
+            return
         while True:
             captured, released_at = self._queue.get()
             try:
