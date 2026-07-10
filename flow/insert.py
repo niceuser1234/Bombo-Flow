@@ -16,6 +16,26 @@ from AppKit import NSPasteboard, NSPasteboardTypeString
 
 log = logging.getLogger(__name__)
 
+
+def accessibility_trusted(prompt: bool = False) -> bool:
+    """Whether this process may inject events into other apps.
+
+    Without the Accessibility grant, the synthetic Cmd+V is confined to the
+    host app (e.g. the terminal), so dictation only ever pastes there. With
+    prompt=True, macOS shows its permission dialog and deep-links to the pane.
+    """
+    from ApplicationServices import (
+        AXIsProcessTrusted,
+        AXIsProcessTrustedWithOptions,
+        kAXTrustedCheckOptionPrompt,
+    )
+
+    if prompt:
+        return bool(
+            AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True})
+        )
+    return bool(AXIsProcessTrusted())
+
 _MODIFIER_MASK = (
     Quartz.kCGEventFlagMaskCommand
     | Quartz.kCGEventFlagMaskAlternate

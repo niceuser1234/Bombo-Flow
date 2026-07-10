@@ -5,6 +5,7 @@ import logging.handlers
 
 from . import config as config_mod
 from .hotkey import HotkeyListener
+from .insert import accessibility_trusted
 from .menubar import FlowApp
 from .pipeline import Pipeline
 
@@ -27,6 +28,18 @@ def main():
     cfg = config_mod.load()
     log.info("Starting whisper-flow (hotkey=%s engine=%s cleanup=%s)",
              cfg.hotkey, cfg.engine, cfg.cleanup_enabled)
+
+    # Pasting into other apps needs the Accessibility grant for the HOST
+    # process (the terminal in dev, Python.app under the LaunchAgent). Without
+    # it the synthetic Cmd+V only reaches the host app, so text lands in the
+    # terminal instead of the focused app. Prompt once so the fix is obvious.
+    if not accessibility_trusted(prompt=True):
+        log.warning(
+            "Accessibility permission NOT granted for the host app — pasted "
+            "text will land in the terminal, not the focused app. Grant it in "
+            "System Settings > Privacy & Security > Accessibility, then fully "
+            "quit and relaunch the host app."
+        )
 
     pipeline = Pipeline(cfg, set_state=lambda s: None)
     app = FlowApp(pipeline)
