@@ -20,10 +20,27 @@ whisper_model = "mlx-community/whisper-large-v3-turbo"
 
 [cleanup]
 # LLM cleanup of the raw transcript (removes filler words, fixes punctuation).
-# Requires an Anthropic API key in the Keychain or ANTHROPIC_API_KEY env var:
-#   security add-generic-password -s whisper-flow -a anthropic -w YOUR_KEY
 enabled = true
-model = "claude-haiku-4-5"
+
+# Which LLM provider to use: "openrouter" (or any OpenAI-compatible endpoint)
+# or "anthropic" (Claude via the official SDK).
+provider = "openrouter"
+
+# The API key is read from the Keychain (never stored in plain text). Store it:
+#   OpenRouter:  security add-generic-password -s whisper-flow -a openrouter -w YOUR_KEY
+#   Anthropic:   security add-generic-password -s whisper-flow -a anthropic  -w YOUR_KEY
+# Env vars OPENROUTER_API_KEY / ANTHROPIC_API_KEY also work and take precedence.
+
+# Base URL for OpenAI-compatible providers (ignored when provider = "anthropic").
+base_url = "https://openrouter.ai/api/v1"
+
+# The model to use. Must match the provider's model ID.
+#   OpenRouter (price/quality sweet spot for dictation cleanup, ~10x cheaper
+#   than Claude Haiku, strong German): "google/gemini-2.5-flash-lite"
+#   Newer, slightly better quality:     "google/gemini-3.1-flash-lite"
+#   Anthropic direct:                   "claude-haiku-4-5"
+model = "google/gemini-2.5-flash-lite"
+
 # Skip cleanup for transcripts shorter than this many words.
 min_words = 4
 # Give up on cleanup after this many seconds and paste the raw transcript.

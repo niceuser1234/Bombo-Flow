@@ -18,6 +18,8 @@ class Config:
     parakeet_model: str = "mlx-community/parakeet-tdt-0.6b-v3"
     whisper_model: str = "mlx-community/whisper-large-v3-turbo"
     cleanup_enabled: bool = True
+    cleanup_provider: str = "anthropic"
+    cleanup_base_url: str = "https://openrouter.ai/api/v1"
     cleanup_model: str = "claude-haiku-4-5"
     cleanup_min_words: int = 4
     cleanup_timeout_s: float = 5.0
@@ -42,6 +44,8 @@ def load() -> Config:
     cfg.parakeet_model = stt.get("parakeet_model", cfg.parakeet_model)
     cfg.whisper_model = stt.get("whisper_model", cfg.whisper_model)
     cfg.cleanup_enabled = bool(cleanup.get("enabled", cfg.cleanup_enabled))
+    cfg.cleanup_provider = cleanup.get("provider", cfg.cleanup_provider)
+    cfg.cleanup_base_url = cleanup.get("base_url", cfg.cleanup_base_url)
     cfg.cleanup_model = cleanup.get("model", cfg.cleanup_model)
     cfg.cleanup_min_words = int(cleanup.get("min_words", cfg.cleanup_min_words))
     cfg.cleanup_timeout_s = float(cleanup.get("timeout_s", cfg.cleanup_timeout_s))
