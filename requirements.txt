@@ -8,6 +8,7 @@ pynput>=1.8
 pyobjc-framework-ApplicationServices
 pyobjc-framework-Cocoa
 pyobjc-framework-Quartz
+pyobjc-framework-WebKit
 rumps>=0.4
 sounddevice>=0.5
 

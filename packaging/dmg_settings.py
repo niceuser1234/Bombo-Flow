@@ -1,13 +1,13 @@
 """dmgbuild settings: drag-to-Applications layout."""
 
-application = "dist/WhisperFlow.app"
+application = "dist/Bomboclat Flow.app"
 
 files = [application]
 symlinks = {"Applications": "/Applications"}
 
-icon = "packaging/WhisperFlow.icns"
+icon = "packaging/BomboclatFlow.icns"
 icon_locations = {
-    "WhisperFlow.app": (140, 150),
+    "Bomboclat Flow.app": (140, 150),
     "Applications": (420, 150),
 }
 

@@ -1,4 +1,4 @@
-"""Generate packaging/WhisperFlow.icns: 🎤 on a rounded-rect background.
+"""Generate packaging/BomboclatFlow.icns: 🎤 on a rounded-rect background.
 
 Run once (committed .icns is used by the build):
     .venv/bin/python packaging/make_icon.py
@@ -50,7 +50,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         master = Path(tmp) / "master.png"
         render_master(master)
-        iconset = Path(tmp) / "WhisperFlow.iconset"
+        iconset = Path(tmp) / "BomboclatFlow.iconset"
         iconset.mkdir()
         for pts in (16, 32, 128, 256, 512):
             for scale in (1, 2):
@@ -64,10 +64,10 @@ def main():
                 )
         subprocess.run(
             ["iconutil", "-c", "icns", str(iconset),
-             "-o", str(HERE / "WhisperFlow.icns")],
+             "-o", str(HERE / "BomboclatFlow.icns")],
             check=True,
         )
-    print(f"Wrote {HERE / 'WhisperFlow.icns'}")
+    print(f"Wrote {HERE / 'BomboclatFlow.icns'}")
 
 
 if __name__ == "__main__":

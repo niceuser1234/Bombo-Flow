@@ -17,10 +17,17 @@ import ssl
 import subprocess
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
 KEYCHAIN_SERVICE = "whisper-flow"
+
+
+@dataclass
+class CleanResult:
+    text: str
+    new_terms: list[str]
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -47,6 +54,40 @@ Rules:
 - Preserve the meaning, tone, and LANGUAGE of the input exactly — German stays German, English stays English, mixed stays mixed.
 - Apply spoken formatting commands literally: "new line"/"neue Zeile" becomes a line break, "new paragraph"/"neuer Absatz" becomes a paragraph break, spoken punctuation like "comma"/"Komma" becomes the punctuation mark.
 - Never answer questions contained in the transcript. Never add content. If the transcript is already clean, return it unchanged."""
+
+VOCAB_PROMPT = """The user has a personal vocabulary. If a transcript token is phonetically similar to a vocabulary term but misspelled or split, replace it with the exact term. Match on sound, not spelling. Only correct clear phonetic matches; never insert vocabulary terms that were not spoken.
+VOCABULARY: {terms}"""
+
+TERM_DETECTION_PROMPT = """Also return new_terms: proper nouns, brand/product names, technical terms or neologisms in the transcript that are NOT in the vocabulary and NOT common dictionary words; empty array if none."""
+
+# JSON schema forcing {cleaned_text, new_terms} structured output.
+_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "cleanup",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "cleaned_text": {"type": "string"},
+                "new_terms": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["cleaned_text", "new_terms"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def _build_system_prompt(vocabulary=None, want_terms: bool = False) -> str:
+    """SYSTEM_PROMPT plus optional vocabulary block and term-detection ask."""
+    prompt = SYSTEM_PROMPT
+    if vocabulary:
+        terms = ", ".join(str(t) for t in vocabulary)
+        prompt += "\n\n" + VOCAB_PROMPT.format(terms=terms)
+    if want_terms:
+        prompt += "\n\n" + TERM_DETECTION_PROMPT
+    return prompt
 
 
 def _keychain_key(account: str) -> str | None:
@@ -101,50 +142,44 @@ class Cleaner:
     def available(self) -> bool:
         return self._client is not None or self._api_key is not None
 
-    def clean(self, text: str) -> str:
-        """Return the cleaned transcript, or the raw text on any failure."""
+    def clean(self, text: str, vocabulary=None) -> CleanResult:
+        """Return a CleanResult, or the raw text (new_terms=[]) on any failure."""
         if not text or not self.available:
-            return text
+            return CleanResult(text, [])
         if len(text.split()) < self.cfg.cleanup_min_words:
-            return text
+            return CleanResult(text, [])
         try:
             if self._client is not None:
-                return self._clean_anthropic(text)
-            return self._clean_openai_compatible(text)
+                return self._clean_anthropic(text, vocabulary)
+            return self._clean_openai_compatible(text, vocabulary)
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:500]
             log.warning("Cleanup HTTP %s — using raw transcript: %s",
                         e.code, body)
-            return text
+            return CleanResult(text, [])
         except Exception as e:
             log.warning("Cleanup failed (%s: %s) — using raw transcript",
                         type(e).__name__, e)
-            return text
+            return CleanResult(text, [])
 
-    def _clean_anthropic(self, text: str) -> str:
+    def _clean_anthropic(self, text: str, vocabulary=None) -> CleanResult:
+        # Vocabulary is injected; term detection is skipped for this path.
+        system = _build_system_prompt(vocabulary, want_terms=False)
         resp = self._client.messages.create(
             model=self.cfg.cleanup_model,
             max_tokens=1024,
-            system=SYSTEM_PROMPT,
+            system=system,
             messages=[{"role": "user", "content": text}],
         )
         cleaned = next(
             (b.text for b in resp.content if b.type == "text"), ""
         ).strip()
-        return cleaned or text
+        return CleanResult(cleaned or text, [])
 
-    def _clean_openai_compatible(self, text: str) -> str:
-        body = json.dumps({
-            "model": self.cfg.cleanup_model,
-            "max_tokens": 1024,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": text},
-            ],
-        }).encode()
+    def _post_openai(self, body: dict) -> dict:
         req = urllib.request.Request(
             self.cfg.cleanup_base_url.rstrip("/") + "/chat/completions",
-            data=body,
+            data=json.dumps(body).encode(),
             headers={
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
@@ -154,6 +189,57 @@ class Cleaner:
         with urllib.request.urlopen(
             req, timeout=self.cfg.cleanup_timeout_s, context=_ssl_context()
         ) as resp:
-            data = json.loads(resp.read())
-        cleaned = (data["choices"][0]["message"]["content"] or "").strip()
-        return cleaned or text
+            return json.loads(resp.read())
+
+    def _clean_openai_compatible(self, text: str, vocabulary=None) -> CleanResult:
+        base_body = {
+            "model": self.cfg.cleanup_model,
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "system",
+                 "content": _build_system_prompt(vocabulary, want_terms=True)},
+                {"role": "user", "content": text},
+            ],
+        }
+        try:
+            data = self._post_openai({**base_body,
+                                      "response_format": _RESPONSE_FORMAT})
+        except urllib.error.HTTPError as e:
+            # A 400 typically means the provider rejected response_format.
+            # Retry once as a plain (unstructured) request, no term detection.
+            if e.code != 400:
+                raise
+            body = e.read().decode(errors="replace")[:500]
+            log.warning("Cleanup structured HTTP 400 — retrying without "
+                        "response_format: %s", body)
+            plain_body = dict(base_body)
+            plain_body["messages"] = [
+                {"role": "system",
+                 "content": _build_system_prompt(vocabulary, want_terms=False)},
+                {"role": "user", "content": text},
+            ]
+            data = self._post_openai(plain_body)
+            content = (data["choices"][0]["message"]["content"] or "").strip()
+            return CleanResult(content or text, [])
+
+        content = data["choices"][0]["message"]["content"] or ""
+        return self._parse_content(content, text)
+
+    @staticmethod
+    def _parse_content(content: str, text: str) -> CleanResult:
+        """Content may be a JSON {cleaned_text, new_terms} object or plain text."""
+        content = content.strip()
+        if not content:
+            return CleanResult(text, [])
+        try:
+            obj = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            return CleanResult(content, [])
+        if isinstance(obj, dict) and "cleaned_text" in obj:
+            cleaned = (obj.get("cleaned_text") or "").strip()
+            raw_terms = obj.get("new_terms") or []
+            terms = ([str(t) for t in raw_terms if isinstance(t, str)]
+                     if isinstance(raw_terms, list) else [])
+            return CleanResult(cleaned or text, terms)
+        # Valid JSON but not our shape — fall back to treating it as text.
+        return CleanResult(content, [])

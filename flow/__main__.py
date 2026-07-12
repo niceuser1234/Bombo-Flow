@@ -47,6 +47,15 @@ def main():
             "quit and relaunch the host app."
         )
 
+    try:
+        from .store import get_store
+
+        purged = get_store().purge_old(days=14)
+        if purged:
+            log.info("Purged %d history entries older than 14 days", purged)
+    except Exception:
+        log.exception("History purge failed")
+
     pipeline = Pipeline(cfg, set_state=lambda s: None)
     app = FlowApp(pipeline)
     pipeline.set_state = app.set_state

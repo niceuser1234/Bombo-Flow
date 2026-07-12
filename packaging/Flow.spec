@@ -1,5 +1,6 @@
-# PyInstaller spec for WhisperFlow.app (Apple Silicon, macOS 14+).
+# PyInstaller spec for "Bomboclat Flow.app" (Apple Silicon, macOS 14+).
 # Build: .venv/bin/pyinstaller --noconfirm packaging/Flow.spec
+import glob
 import os
 
 from PyInstaller.utils.hooks import collect_all
@@ -18,6 +19,11 @@ for pkg in ("mlx", "parakeet_mlx", "soxr"):
 # Default config seeded into ~/Library/Application Support on first launch.
 datas.append((os.path.join(ROOT, "config.toml"), "."))
 
+# The in-app web UI (loaded by flow/window.py via _MEIPASS/flow/ui).
+for f in glob.glob(os.path.join(ROOT, "flow", "ui", "*")):
+    if os.path.isfile(f):
+        datas.append((f, "flow/ui"))
+
 a = Analysis(
     [os.path.join(ROOT, "packaging", "launcher.py")],
     pathex=[ROOT],
@@ -34,7 +40,7 @@ exe = EXE(
     pyz,
     a.scripts,
     exclude_binaries=True,
-    name="WhisperFlow",
+    name="BomboclatFlow",
     console=False,
     target_arch="arm64",
 )
@@ -43,23 +49,25 @@ coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
-    name="WhisperFlow",
+    name="BomboclatFlow",
 )
 
 app = BUNDLE(
     coll,
-    name="WhisperFlow.app",
-    icon=os.path.join(ROOT, "packaging", "WhisperFlow.icns"),
-    bundle_identifier="com.whisperflow.app",
+    name="Bomboclat Flow.app",
+    icon=os.path.join(ROOT, "packaging", "BomboclatFlow.icns"),
+    bundle_identifier="com.bomboclat.flow",
     info_plist={
         # Menu bar agent: no Dock icon, no app switcher entry.
         "LSUIElement": True,
         "LSMinimumSystemVersion": "14.0",
         "NSHighResolutionCapable": True,
         "NSMicrophoneUsageDescription":
-            "WhisperFlow records audio while you hold the hotkey and "
+            "Bomboclat Flow records audio while you hold the hotkey and "
             "transcribes it locally on this Mac.",
-        "CFBundleShortVersionString": "0.1.0",
-        "CFBundleVersion": "1",
+        "CFBundleName": "Bomboclat Flow",
+        "CFBundleDisplayName": "Bomboclat Flow",
+        "CFBundleShortVersionString": "0.2.0",
+        "CFBundleVersion": "2",
     },
 )

@@ -20,6 +20,9 @@ class Recorder:
         self.samplerate = samplerate
         self._chunks: list[np.ndarray] = []
         self._stream: sd.InputStream | None = None
+        # Live mic level in 0.0..1.0, updated from the audio callback and read
+        # (plain attribute, atomic under the GIL) by the recording overlay.
+        self.level: float = 0.0
 
     @property
     def recording(self) -> bool:
@@ -29,6 +32,7 @@ class Recorder:
         if self._stream is not None:
             return
         self._chunks = []
+        self.level = 0.0
         self._stream = sd.InputStream(
             samplerate=self.samplerate,
             channels=1,
@@ -41,6 +45,10 @@ class Recorder:
         if status:
             log.warning("audio status: %s", status)
         self._chunks.append(indata.copy())
+        rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
+        new = min(1.0, rms * 12.0)
+        # Light smoothing so the waveform eases rather than jitters.
+        self.level = 0.6 * self.level + 0.4 * new
 
     def stop(self) -> np.ndarray:
         """Stop recording and return the captured audio as 1-D float32."""
@@ -49,6 +57,7 @@ class Recorder:
         self._stream.stop()
         self._stream.close()
         self._stream = None
+        self.level = 0.0
         if not self._chunks:
             return np.zeros(0, dtype=np.float32)
         audio = np.concatenate(self._chunks)[:, 0]

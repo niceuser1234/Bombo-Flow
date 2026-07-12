@@ -23,6 +23,7 @@ from .permissions import (
     input_monitoring_granted,
     open_privacy_pane,
 )
+from .window import MainWindow
 
 log = logging.getLogger(__name__)
 
@@ -34,8 +35,8 @@ STATE_ICONS = {
     "error": "⚠️",
 }
 
-LAUNCH_AGENT_LABEL = "com.whisperflow.app"
-LEGACY_AGENT_LABELS = ["io.julius.whisperflow"]
+LAUNCH_AGENT_LABEL = "com.bomboclat.flow"
+LEGACY_AGENT_LABELS = ["io.julius.whisperflow", "com.whisperflow.app"]
 
 
 def _agents_dir() -> Path:
@@ -71,8 +72,11 @@ def _launch_agent_plist() -> bytes:
 
 class FlowApp(rumps.App):
     def __init__(self, pipeline):
-        super().__init__("Flow", title=STATE_ICONS["loading"], quit_button=None)
+        super().__init__(
+            "Bomboclat Flow", title=STATE_ICONS["loading"], quit_button=None
+        )
         self.pipeline = pipeline
+        self.main_window = MainWindow()
         self._pending_state = "loading"
         self._shown_state = None
 
@@ -87,6 +91,8 @@ class FlowApp(rumps.App):
         self.login_item.state = _launch_agent_dest().exists()
 
         self.menu = [
+            rumps.MenuItem("Open Bomboclat Flow", callback=self._open_window),
+            None,
             self.cleanup_item,
             rumps.MenuItem("Set API key…", callback=self._set_api_key),
             None,
@@ -234,6 +240,9 @@ class FlowApp(rumps.App):
             rumps.alert("Start at login failed", f"See log: {LOG_PATH}")
 
     # -- misc --
+
+    def _open_window(self, _item):
+        self.main_window.show()
 
     def _open_config(self, _item):
         subprocess.run(["open", str(CONFIG_PATH)])
