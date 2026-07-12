@@ -1,6 +1,10 @@
-"""Generate packaging/BomboclatFlow.icns: 🎤 on a rounded-rect background.
+"""Generate packaging/BomboclatFlow.icns from the Palm-Mic logo SVG.
 
-Run once (committed .icns is used by the build):
+Rasterises packaging/bomboclat_flow_icon.svg (the green Palm-Mic on a cream
+rounded-rect, already sized with macOS icon margins) into an .iconset and packs
+it with iconutil. Reproducible — no hand-assembled assets.
+
+Run when the logo changes (the committed .icns is what the build uses):
     .venv/bin/python packaging/make_icon.py
 """
 
@@ -13,34 +17,24 @@ import Foundation
 
 HERE = Path(__file__).resolve().parent
 SIZE = 1024
+SVG_SOURCE = HERE / "bomboclat_flow_icon.svg"
 
 
 def render_master(path: Path):
+    src = AppKit.NSImage.alloc().initWithContentsOfFile_(str(SVG_SOURCE))
+    if src is None:
+        raise SystemExit(f"Could not load SVG: {SVG_SOURCE}")
+
     img = AppKit.NSImage.alloc().initWithSize_((SIZE, SIZE))
     img.lockFocus()
-
-    # Rounded-rect background, macOS-icon style margins (~10%).
-    inset = SIZE * 0.10
-    rect = Foundation.NSMakeRect(inset, inset, SIZE - 2 * inset, SIZE - 2 * inset)
-    radius = SIZE * 0.18
-    AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(
-        0.13, 0.13, 0.15, 1.0
-    ).setFill()
-    AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-        rect, radius, radius
-    ).fill()
-
-    # Centered emoji.
-    attrs = {AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_(560)}
-    text = Foundation.NSAttributedString.alloc().initWithString_attributes_(
-        "🎤", attrs
+    src.drawInRect_fromRect_operation_fraction_(
+        Foundation.NSMakeRect(0, 0, SIZE, SIZE),
+        Foundation.NSZeroRect,
+        AppKit.NSCompositingOperationSourceOver,
+        1.0,
     )
-    bounds = text.size()
-    text.drawAtPoint_(
-        ((SIZE - bounds.width) / 2, (SIZE - bounds.height) / 2 + SIZE * 0.01)
-    )
-
     img.unlockFocus()
+
     rep = AppKit.NSBitmapImageRep.imageRepWithData_(img.TIFFRepresentation())
     png = rep.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, None)
     png.writeToFile_atomically_(str(path), True)

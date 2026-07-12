@@ -58,3 +58,69 @@ class HotkeyListener:
                 self._on_hold_end()
             except Exception:
                 log.exception("on_hold_end failed")
+
+
+class FnHotkeyListener:
+    """Hold-to-talk on the physical Fn (🌐) key.
+
+    pynput cannot see Fn — it is a hardware modifier that fires a flags-changed
+    event (the secondary-Fn flag) rather than a normal key press. We watch those
+    events through an AppKit global monitor, which runs on the existing AppKit
+    main loop and needs the same Input Monitoring permission as the pynput path.
+
+    The monitor is passive: it cannot swallow Fn's default behaviour (emoji
+    picker / input-source switch). Users disable that in System Settings →
+    Keyboard → "Press 🌐 key to → Do Nothing".
+    """
+
+    def __init__(self, on_hold_start, on_hold_end):
+        self._on_hold_start = on_hold_start
+        self._on_hold_end = on_hold_end
+        self._held = False
+        self._monitor = None
+
+    def start(self):
+        from AppKit import NSEvent, NSEventMaskFlagsChanged
+
+        self._monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            NSEventMaskFlagsChanged, self._handle_event
+        )
+        log.info("Fn hotkey listener started")
+
+    def stop(self):
+        if self._monitor is not None:
+            from AppKit import NSEvent
+
+            NSEvent.removeMonitor_(self._monitor)
+            self._monitor = None
+
+    def _handle_event(self, event):
+        from AppKit import NSEventModifierFlagFunction
+
+        fn_down = bool(event.modifierFlags() & NSEventModifierFlagFunction)
+        self._dispatch(fn_down)
+
+    def _dispatch(self, fn_down):
+        if fn_down and not self._held:
+            self._held = True
+            try:
+                self._on_hold_start()
+            except Exception:
+                log.exception("on_hold_start failed")
+        elif not fn_down and self._held:
+            self._held = False
+            try:
+                self._on_hold_end()
+            except Exception:
+                log.exception("on_hold_end failed")
+
+
+def make_listener(key_name, on_hold_start, on_hold_end):
+    """Pick the right listener for the configured key.
+
+    "fn" needs the AppKit flags-changed monitor; every other key goes through
+    the pynput KEY_MAP listener.
+    """
+    if key_name == "fn":
+        return FnHotkeyListener(on_hold_start, on_hold_end)
+    return HotkeyListener(key_name, on_hold_start, on_hold_end)

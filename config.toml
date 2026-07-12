@@ -2,9 +2,14 @@
 # Hold the hotkey, speak, release — cleaned-up text is pasted at your cursor.
 
 [hotkey]
-# Which key to hold while talking. Options: "alt_r" (Right-Option, default),
-# "cmd_r" (Right-Command), "ctrl_r" (Right-Control), "f13".
-key = "alt_r"
+# Which key to hold while talking. Options: "fn" (the 🌐/Fn key, bottom-left,
+# default), "alt_r" (Right-Option), "cmd_r" (Right-Command),
+# "ctrl_r" (Right-Control), "f13".
+#
+# Note on "fn": macOS assigns the Fn/🌐 key to the emoji picker or input-source
+# switch by default, which can interfere with holding it. Disable that under
+# System Settings → Keyboard → "Press 🌐 key to" → "Do Nothing".
+key = "fn"
 
 [audio]
 # Recordings shorter than this are discarded (accidental taps).

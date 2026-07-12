@@ -1,0 +1,27 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+<title>Bomboclat Flow</title>
+<rect x="100" y="100" width="824" height="824" rx="185" fill="#FFF3E4"/>
+<g transform="translate(512,650.5) scale(2.6)">
+<g transform="translate(0,-74)">
+<g fill="#1F7A52">
+<path d="M0 0 C 6 -34 40 -88 80 -66 C 46 -50 16 -22 0 0 Z"/>
+<path transform="scale(-1,1)" d="M0 0 C 6 -34 40 -88 80 -66 C 46 -50 16 -22 0 0 Z"/>
+<path d="M0 0 C -9 -36 -9 -74 14 -102 C 4 -70 4 -34 0 0 Z"/>
+</g>
+<g fill="#3FAE7B">
+<path d="M0 0 C 16 -38 58 -52 106 -14 C 60 -24 26 -8 0 0 Z"/>
+<path transform="scale(-1,1)" d="M0 0 C 16 -38 58 -52 106 -14 C 60 -24 26 -8 0 0 Z"/>
+</g>
+</g>
+<g fill="#22313F">
+<rect x="-24" y="-80" width="48" height="94" rx="24"/>
+<rect x="-5.5" y="32" width="11" height="30" rx="5.5"/>
+<rect x="-30" y="58" width="60" height="11.5" rx="5.75"/>
+</g>
+<path d="M-42 -8 A42 42 0 0 0 42 -8" fill="none" stroke="#22313F" stroke-width="11.5" stroke-linecap="round"/>
+<g fill="#FFF3E4">
+<rect x="-12" y="-55" width="24" height="5.5" rx="2.75"/>
+<rect x="-12" y="-43" width="24" height="5.5" rx="2.75"/>
+</g>
+</g>
+</svg>

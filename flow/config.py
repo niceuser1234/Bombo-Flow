@@ -31,7 +31,7 @@ def _bundled_default_config() -> Path:
 
 @dataclass
 class Config:
-    hotkey: str = "alt_r"
+    hotkey: str = "fn"
     min_duration_s: float = 0.3
     max_duration_s: float = 120.0
     engine: str = "parakeet"

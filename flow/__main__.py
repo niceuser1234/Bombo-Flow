@@ -3,10 +3,19 @@
 import logging
 import logging.handlers
 import os
+import sys
 
 from . import config as config_mod
-from .hotkey import HotkeyListener
+from .hotkey import make_listener
 from .insert import accessibility_trusted
+from .lifecycle import (
+    InstanceLock,
+    is_running_from_disk_image,
+    request_open_or_take_over,
+    request_existing_instance_to_open,
+    should_show_dashboard,
+    show_install_required_alert,
+)
 from .menubar import FlowApp
 from .pipeline import Pipeline
 
@@ -31,6 +40,28 @@ def main():
     numba_cache = config_mod.APP_SUPPORT / "numba-cache"
     numba_cache.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("NUMBA_CACHE_DIR", str(numba_cache))
+
+    instance_lock = None
+    if config_mod.IS_FROZEN:
+        if is_running_from_disk_image():
+            log.info("Refusing to run from a mounted disk image")
+            show_install_required_alert()
+            return
+
+        lock_path = config_mod.APP_SUPPORT / "instance.lock"
+        request_path = config_mod.APP_SUPPORT / "open-dashboard.request"
+        instance_lock = InstanceLock.acquire(lock_path)
+        if instance_lock is None:
+            instance_lock = request_open_or_take_over(
+                lock_path,
+                request_path,
+                notify=request_existing_instance_to_open,
+            )
+            if instance_lock is None:
+                log.info("Dashboard request forwarded to existing instance")
+                return
+            log.info("Previous instance exited during handoff; taking over")
+
     cfg = config_mod.load()
     log.info("Starting whisper-flow (hotkey=%s engine=%s cleanup=%s)",
              cfg.hotkey, cfg.engine, cfg.cleanup_enabled)
@@ -57,18 +88,22 @@ def main():
         log.exception("History purge failed")
 
     pipeline = Pipeline(cfg, set_state=lambda s: None)
-    app = FlowApp(pipeline)
+    app = FlowApp(pipeline, show_on_launch=should_show_dashboard(sys.argv))
     pipeline.set_state = app.set_state
     pipeline.start()
 
-    listener = HotkeyListener(
+    listener = make_listener(
         cfg.hotkey,
         on_hold_start=pipeline.on_hold_start,
         on_hold_end=pipeline.on_hold_end,
     )
     listener.start()
 
-    app.run()  # blocks on the AppKit main loop
+    try:
+        app.run()  # blocks on the AppKit main loop
+    finally:
+        if instance_lock is not None:
+            instance_lock.release()
 
 
 if __name__ == "__main__":
