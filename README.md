@@ -3,19 +3,32 @@
 A personal Wispr Flow clone for macOS: **hold Right-Option, speak, release** — polished text appears at your cursor in whatever app is focused.
 
 - **Free to run**: speech-to-text happens locally on the M-series GPU (NVIDIA Parakeet via MLX, auto-detects German/English, <1 s per dictation)
-- **Optional AI cleanup**: Claude Haiku removes filler words and fixes punctuation (~$0.0007 per dictation, falls back to the raw transcript if offline)
+- **Optional AI cleanup**: an LLM removes filler words and fixes punctuation — via OpenRouter (default: Gemini 2.5 Flash-Lite, ~$0.00006 per dictation) or the Anthropic API. Falls back to the raw transcript if offline.
 - Lives in the menu bar: 🎤 idle · 🔴 recording · ✍️ processing · ⏳ loading · ⚠️ error
 
-## Run it
+## The Mac app (recommended)
+
+Build once, then it's a normal double-clickable app:
 
 ```sh
-cd ~/dev/whisper-flow
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+./packaging/build.sh
+```
+
+This produces `dist/WhisperFlow.app` and `dist/WhisperFlow.dmg` (drag-to-Applications installer). On first launch the app guides you through the permissions (see below) and downloads the STT model (~2.3 GB, one time).
+
+**Signing note:** the build ad-hoc-signs by default, which makes macOS forget the app's permission grants on every rebuild. To keep grants stable across rebuilds, create a self-signed code-signing certificate named `WhisperFlow Dev` (Keychain Access → Certificate Assistant → Create a Certificate → type "Code Signing") — `build.sh` picks it up automatically. Opening the app on *another* Mac requires System Settings → Privacy & Security → "Open Anyway" once (the app is not notarized).
+
+## Run from source (dev)
+
+```sh
 .venv/bin/python -m flow
 ```
 
-## First-run permissions (one time)
+## Permissions (one time)
 
-macOS will prompt for three permissions the first time each feature is used. The permissions attach to the **host app** — Terminal while you run it from a terminal, **Python** (`Python.app` inside the python.org framework) once it runs via the LaunchAgent. Check them in **System Settings → Privacy & Security**:
+macOS prompts for three permissions; they attach to the **host app** (WhisperFlow.app, or your terminal when running from source). The app checks at startup and offers to open the right Settings pane; there's also **Check permissions** in the menu.
 
 | Permission | Needed for | Prompted when |
 |---|---|---|
@@ -23,40 +36,43 @@ macOS will prompt for three permissions the first time each feature is used. The
 | Microphone | recording | first recording |
 | Accessibility | the synthetic Cmd+V paste | first paste |
 
-If a pane doesn't prompt, add the app manually with the “+” button. **Note:** upgrading/reinstalling Python invalidates these grants — re-grant after a Python update.
+After granting Input Monitoring or Accessibility, quit and reopen the app.
 
 ## Enable AI cleanup
 
-Store your Anthropic API key in the Keychain (never written to disk in plain text):
+Menu → **Set API key…** — the key is stored in the macOS Keychain, never in a file. Get a key at [openrouter.ai](https://openrouter.ai/settings/keys) (default provider) or use an Anthropic key with `provider = "anthropic"` in the config.
+
+Equivalent terminal command:
 
 ```sh
-security add-generic-password -s whisper-flow -a anthropic -w YOUR_API_KEY
+security add-generic-password -s whisper-flow -a openrouter -w YOUR_KEY
 ```
 
-Restart the app. The "AI cleanup" menu item toggles it per-session; `[cleanup] enabled` in `config.toml` sets the default. Without a key the app pastes the raw transcript (Parakeet's own punctuation is decent).
-
-## Start at login
-
-Click **Start at login** in the menu — it installs `launchagent/io.julius.whisperflow.plist` into `~/Library/LaunchAgents` and loads it. On the first launchd-run, approve the permission prompts again for "Python".
+The **AI cleanup** menu item toggles it per-session; `[cleanup] enabled` in the config sets the default. Without a key the app pastes the raw transcript (Parakeet's own punctuation is decent).
 
 ## Configuration
 
-Edit `config.toml`: hotkey (`alt_r`/`cmd_r`/`ctrl_r`/`f13`), min/max recording duration, STT engine, cleanup model/timeout, insert mode (`paste` or `type` for apps that block programmatic paste).
+Menu → **Open config**. The app reads `~/Library/Application Support/whisper-flow/config.toml` (seeded on first launch); source runs read `config.toml` in the repo. Options: hotkey (`alt_r`/`cmd_r`/`ctrl_r`/`f13`), min/max recording duration, STT engine, cleanup provider/model/timeout, insert mode (`paste` or `type` for apps that block programmatic paste).
+
+## Start at login
+
+Menu → **Start at login** installs a LaunchAgent pointing at whatever is currently running (the .app or your dev checkout) and loads it.
 
 ## Troubleshooting
 
 - Log file: `~/Library/Logs/whisper-flow.log` (also via menu → Open log)
-- ⚠️ icon right after releasing the key + "recording is silent" in the log → Microphone permission missing for the host app
-- Hotkey does nothing → Input Monitoring permission missing
+- ⚠️ icon right after releasing the key + "recording is silent" in the log → Microphone permission missing
+- Hotkey does nothing → Input Monitoring permission missing (menu → Check permissions)
 - Text lands in clipboard but doesn't paste → Accessibility permission missing
 - Some app pastes "Paste and Match Style" instead → keep holding the key shorter; the app waits for all modifiers to be released before pasting
-- Want Whisper instead of Parakeet: `.venv/bin/pip install mlx-whisper`, set `engine = "whisper"` in config.toml
+- Want Whisper instead of Parakeet: `.venv/bin/pip install mlx-whisper`, set `engine = "whisper"` in the config
 
 ## Architecture
 
 ```
 hotkey.py (pynput, Right-Option) ─► audio.py (sounddevice, 16 kHz)
-    ─► stt.py (parakeet-mlx on GPU) ─► cleanup.py (Claude Haiku, optional)
+    ─► stt.py (parakeet-mlx on GPU) ─► cleanup.py (LLM via OpenRouter/Anthropic, optional)
     ─► insert.py (clipboard + Cmd+V, clipboard restored afterwards)
-menubar.py (rumps) shows state; pipeline.py runs the worker thread.
+menubar.py (rumps) shows state + settings; permissions.py checks TCC grants;
+pipeline.py runs the worker thread; packaging/ builds WhisperFlow.app + DMG.
 ```

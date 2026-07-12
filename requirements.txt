@@ -1,0 +1,16 @@
+# Runtime dependencies (Apple Silicon, Python 3.12)
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+anthropic>=0.116
+certifi
+numpy
+parakeet-mlx>=0.5
+pynput>=1.8
+pyobjc-framework-ApplicationServices
+pyobjc-framework-Cocoa
+pyobjc-framework-Quartz
+rumps>=0.4
+sounddevice>=0.5
+
+# Build tooling for the .app/DMG (only needed for packaging/build.sh)
+dmgbuild
+pyinstaller

@@ -2,6 +2,7 @@
 
 import logging
 import logging.handlers
+import os
 
 from . import config as config_mod
 from .hotkey import HotkeyListener
@@ -25,6 +26,11 @@ def setup_logging():
 def main():
     setup_logging()
     log = logging.getLogger("flow")
+    # librosa (via parakeet-mlx) imports numba, which wants a writable JIT
+    # cache — inside a read-only .app bundle that must live elsewhere.
+    numba_cache = config_mod.APP_SUPPORT / "numba-cache"
+    numba_cache.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("NUMBA_CACHE_DIR", str(numba_cache))
     cfg = config_mod.load()
     log.info("Starting whisper-flow (hotkey=%s engine=%s cleanup=%s)",
              cfg.hotkey, cfg.engine, cfg.cleanup_enabled)
