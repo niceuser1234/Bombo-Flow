@@ -149,5 +149,62 @@ class RecorderStopTimeoutTests(unittest.TestCase):
         self.assertTrue(pipeline.recorder.recording)
 
 
+class LockNotHeldAcrossStopTests(unittest.TestCase):
+    def test_lock_is_free_while_stop_blocks(self):
+        pipeline = _build_pipeline()
+        pipeline.recorder._recording = True
+        enter = threading.Event()
+        release = threading.Event()
+
+        def hanging_stop():
+            enter.set()
+            release.wait(5.0)
+            return np.zeros(100, dtype=np.float32)
+
+        pipeline.recorder.stop = hanging_stop
+
+        t = threading.Thread(target=pipeline.on_hold_end)
+        t.start()
+        self.assertTrue(enter.wait(1.0), "stop() was never entered")
+
+        self.assertTrue(pipeline._lock.acquire(timeout=0.2))
+        pipeline._lock.release()
+        self.assertTrue(pipeline._stopping)
+
+        release.set()
+        t.join(timeout=5.0)
+        self.assertFalse(t.is_alive())
+        self.assertFalse(pipeline._stopping)
+
+    def test_start_refused_while_stop_in_flight(self):
+        pipeline = _build_pipeline()
+        pipeline.engine = True
+        pipeline.recorder._recording = True
+        enter = threading.Event()
+        release = threading.Event()
+
+        def hanging_stop():
+            enter.set()
+            release.wait(5.0)
+            return np.zeros(100, dtype=np.float32)
+
+        pipeline.recorder.stop = hanging_stop
+        start_calls = []
+        pipeline.recorder.start = lambda: start_calls.append(1)
+
+        t = threading.Thread(target=pipeline.on_hold_end)
+        t.start()
+        self.assertTrue(enter.wait(1.0), "stop() was never entered")
+
+        start = threading.Thread(target=pipeline.on_hold_start)
+        start.start()
+        start.join(timeout=1.0)
+        self.assertFalse(start.is_alive(), "on_hold_start blocked")
+        self.assertEqual(start_calls, [])
+
+        release.set()
+        t.join(timeout=5.0)
+
+
 if __name__ == "__main__":
     unittest.main()

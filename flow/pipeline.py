@@ -122,24 +122,26 @@ class Pipeline:
             self._max_timer.start()
 
     def on_hold_end(self):
-        with self._lock:
-            self._finish_recording()
+        self._finish_recording()
 
     def _force_stop(self):
         log.warning("Max recording duration reached — stopping")
-        with self._lock:
-            self._finish_recording()
+        self._finish_recording()
 
     def _finish_recording(self):
-        if not self.recorder.recording:
-            return
-        if self._max_timer:
-            self._max_timer.cancel()
-            self._max_timer = None
-        self._stopping = True
-        duration = time.monotonic() - self._press_time
-        captured = self._stop_recorder_safe()
-        self._stopping = False
+        with self._lock:
+            if not self.recorder.recording or self._stopping:
+                return
+            self._stopping = True
+            if self._max_timer:
+                self._max_timer.cancel()
+                self._max_timer = None
+            duration = time.monotonic() - self._press_time
+        try:
+            captured = self._stop_recorder_safe()
+        finally:
+            with self._lock:
+                self._stopping = False
 
         self.overlay.hide()
         if duration < self.cfg.min_duration_s:
