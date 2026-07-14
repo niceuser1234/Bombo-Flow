@@ -137,27 +137,30 @@ class Pipeline:
                 self._max_timer.cancel()
                 self._max_timer = None
             duration = time.monotonic() - self._press_time
+        # _stopping stays True until the tail below finishes, so a fast
+        # re-press cannot start a recording whose state/overlay this old
+        # press would then stomp. The blocking stop still runs lock-free.
         try:
             captured = self._stop_recorder_safe()
+
+            self.overlay.hide()
+            if duration < self.cfg.min_duration_s:
+                log.info("Discarding %.2fs tap", duration)
+                self.set_state("idle")
+                return
+            if audio_mod.is_silent(captured):
+                log.warning(
+                    "Recording is silent — check Microphone permission for the "
+                    "host app in System Settings > Privacy & Security > Microphone"
+                )
+                self.set_state("error")
+                threading.Timer(2.0, lambda: self.set_state("idle")).start()
+                return
+            self.set_state("processing")
+            self._queue.put((captured, time.monotonic()))
         finally:
             with self._lock:
                 self._stopping = False
-
-        self.overlay.hide()
-        if duration < self.cfg.min_duration_s:
-            log.info("Discarding %.2fs tap", duration)
-            self.set_state("idle")
-            return
-        if audio_mod.is_silent(captured):
-            log.warning(
-                "Recording is silent — check Microphone permission for the "
-                "host app in System Settings > Privacy & Security > Microphone"
-            )
-            self.set_state("error")
-            threading.Timer(2.0, lambda: self.set_state("idle")).start()
-            return
-        self.set_state("processing")
-        self._queue.put((captured, time.monotonic()))
 
     def _stop_recorder_safe(self) -> "np.ndarray":
         """Stop the recorder off the calling thread, with a hard timeout.

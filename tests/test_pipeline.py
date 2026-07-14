@@ -192,18 +192,54 @@ class LockNotHeldAcrossStopTests(unittest.TestCase):
         start_calls = []
         pipeline.recorder.start = lambda: start_calls.append(1)
 
+        # Pin the timeout above every wait below so the stop is guaranteed
+        # to still be in flight while we probe, whatever the real constant.
+        with patch("flow.pipeline.STOP_TIMEOUT_S", 5.0):
+            t = threading.Thread(target=pipeline.on_hold_end)
+            t.start()
+            self.assertTrue(enter.wait(1.0), "stop() was never entered")
+
+            start = threading.Thread(target=pipeline.on_hold_start)
+            start.start()
+            start.join(timeout=1.0)
+            self.assertFalse(start.is_alive(), "on_hold_start blocked")
+            self.assertEqual(start_calls, [])
+
+            release.set()
+            t.join(timeout=5.0)
+
+    def test_start_refused_while_tail_still_running(self):
+        """_stopping must stay True through the post-stop tail (overlay.hide,
+        state changes) so a fast re-press cannot race the old press's
+        cleanup."""
+        pipeline = _build_pipeline()
+        pipeline.engine = True
+        pipeline.recorder._recording = True
+        hide_entered = threading.Event()
+        hide_release = threading.Event()
+
+        def hanging_hide():
+            hide_entered.set()
+            hide_release.wait(5.0)
+
+        pipeline.overlay.hide = hanging_hide
+        start_calls = []
+        pipeline.recorder.start = lambda: start_calls.append(1)
+
         t = threading.Thread(target=pipeline.on_hold_end)
         t.start()
-        self.assertTrue(enter.wait(1.0), "stop() was never entered")
+        self.assertTrue(hide_entered.wait(1.0), "overlay.hide was never entered")
 
-        start = threading.Thread(target=pipeline.on_hold_start)
-        start.start()
-        start.join(timeout=1.0)
-        self.assertFalse(start.is_alive(), "on_hold_start blocked")
+        # stop() has returned; the tail is still running.
+        self.assertEqual(pipeline.recorder.stops, 1)
+        self.assertTrue(pipeline._stopping)
+        pipeline.on_hold_start()
         self.assertEqual(start_calls, [])
 
-        release.set()
+        hide_release.set()
         t.join(timeout=5.0)
+        self.assertFalse(t.is_alive())
+        self.assertFalse(pipeline._stopping)
 
 
 if __name__ == "__main__":
