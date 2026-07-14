@@ -26,6 +26,7 @@ class _Recorder:
     def __init__(self):
         self._recording = False
         self.stops = 0
+        self.abandoned = 0
 
     @property
     def recording(self):
@@ -38,6 +39,9 @@ class _Recorder:
         self.stops += 1
         self._recording = False
         return np.zeros(100, dtype=np.float32)
+
+    def abandon(self):
+        self.abandoned += 1
 
     @property
     def level(self):
@@ -138,6 +142,7 @@ class RecorderStopTimeoutTests(unittest.TestCase):
 
         self.assertIsNot(pipeline.recorder, wedged)
         self.assertFalse(pipeline.recorder.recording)
+        self.assertEqual(wedged.abandoned, 1)
 
         pipeline.engine = True
         pipeline.on_hold_start()

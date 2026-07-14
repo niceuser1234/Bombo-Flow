@@ -1,3 +1,4 @@
+import threading
 import unittest
 
 import numpy as np
@@ -40,6 +41,43 @@ class RecorderCallbackTests(unittest.TestCase):
         quiet = np.full((160, 1), 0.01, dtype=np.float32)
         rec._callback(quiet, 160, None, None)
         self.assertGreater(rec.level, 0.1)
+
+
+class _FakeStream:
+    def __init__(self, done_event):
+        self._done_event = done_event
+        self.abort_calls = 0
+        self.close_calls = 0
+
+    def abort(self, ignore_errors=False):
+        self.abort_calls += 1
+
+    def close(self, ignore_errors=False):
+        self.close_calls += 1
+        self._done_event.set()
+
+
+class RecorderAbandonTests(unittest.TestCase):
+    def test_abandon_discards_callback_and_closes_stream_async(self):
+        rec = audio.Recorder()
+        done = threading.Event()
+        fake_stream = _FakeStream(done)
+        rec._stream = fake_stream
+        rec._chunks = [np.zeros((10, 1), dtype=np.float32)]
+        rec.level = 0.42
+
+        rec.abandon()
+
+        # Discard must take effect synchronously so the callback can't
+        # append more chunks even before the abort thread runs.
+        loud = np.full((160, 1), 0.5, dtype=np.float32)
+        rec._callback(loud, 160, None, None)
+        self.assertEqual(rec._chunks, [])
+        self.assertEqual(rec.level, 0.0)
+
+        self.assertTrue(done.wait(2.0), "stream was not closed in background")
+        self.assertEqual(fake_stream.abort_calls, 1)
+        self.assertEqual(fake_stream.close_calls, 1)
 
 
 if __name__ == "__main__":

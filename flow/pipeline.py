@@ -190,6 +190,7 @@ class Pipeline:
                 "stalled; abandoning the stream and rebuilding the recorder",
                 STOP_TIMEOUT_S,
             )
+            stuck.abandon()
             # The overlay's level_source closes over `self`, so it follows the
             # swap without further wiring.
             self.recorder = Recorder()

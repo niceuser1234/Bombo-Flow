@@ -5,6 +5,7 @@ missing, so callers should check `is_silent()` on the result.
 """
 
 import logging
+import threading
 
 import numpy as np
 import sounddevice as sd
@@ -48,6 +49,8 @@ class Recorder:
         # Live mic level in 0.0..1.0, updated from the audio callback and read
         # (plain attribute, atomic under the GIL) by the recording overlay.
         self.level: float = 0.0
+        # Set by abandon() to make a wedged recorder's callback a no-op.
+        self._discard = False
 
     @property
     def recording(self) -> bool:
@@ -58,6 +61,7 @@ class Recorder:
             return
         self._chunks = []
         self.level = 0.0
+        self._discard = False
         self._stream = sd.InputStream(
             samplerate=self.samplerate,
             channels=1,
@@ -67,6 +71,8 @@ class Recorder:
         self._stream.start()
 
     def _callback(self, indata, frames, time_info, status):
+        if self._discard:
+            return
         if status:
             log.warning("audio status: %s", status)
         self._chunks.append(indata.copy())
@@ -87,6 +93,25 @@ class Recorder:
         audio = np.concatenate(self._chunks)[:, 0]
         self._chunks = []
         return audio
+
+    def abandon(self):
+        """Give up on a wedged stream: stop feeding the callback and close
+        the CoreAudio stream in the background, without blocking or ever
+        touching `self._stream` again (a late-completing `stop()` may still
+        be racing to clear it)."""
+        self._discard = True
+        self._chunks = []
+        self.level = 0.0
+        stream = self._stream
+
+        def _close():
+            try:
+                stream.abort(ignore_errors=True)
+                stream.close(ignore_errors=True)
+            except Exception:
+                log.exception("Error closing abandoned stream")
+
+        threading.Thread(target=_close, daemon=True, name="recorder-abort").start()
 
     def duration(self) -> float:
         """Seconds captured so far (approximate, while recording)."""
