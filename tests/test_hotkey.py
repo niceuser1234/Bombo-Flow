@@ -240,5 +240,92 @@ class FnRunsOffMainThreadTests(unittest.TestCase):
             listener.stop()
 
 
+class PynputRunsOffMainThreadTests(unittest.TestCase):
+    """pynput delivers on_press/on_release on its own listener thread.
+
+    A wedged callback there must not freeze delivery of further keyboard
+    events, so HotkeyListener routes callbacks through a SerialRunner just
+    like FnHotkeyListener does.
+    """
+
+    def test_callback_runs_on_another_thread(self):
+        ran_on = []
+        done = threading.Event()
+
+        def on_start():
+            ran_on.append(threading.current_thread().ident)
+            done.set()
+
+        listener = HotkeyListener("alt_r", on_start, lambda: None)
+        listener.start_dispatcher()
+        try:
+            listener._on_press(listener._key)
+            self.assertTrue(done.wait(2.0), "callback never ran")
+        finally:
+            listener.stop()
+
+        self.assertNotEqual(ran_on[0], threading.current_thread().ident)
+
+    def test_on_press_returns_while_callback_is_still_blocked(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def stuck_start():
+            entered.set()
+            release.wait(5.0)  # stands in for a wedged callback
+
+        listener = HotkeyListener("alt_r", stuck_start, lambda: None)
+        listener.start_dispatcher()
+        try:
+            listener._on_press(listener._key)  # must not block
+            self.assertTrue(entered.wait(2.0))
+            self.assertFalse(release.is_set())
+        finally:
+            release.set()
+            listener.stop()
+
+    def test_press_and_release_stay_ordered(self):
+        seen = []
+        done = threading.Event()
+
+        def on_end():
+            seen.append("end")
+            done.set()
+
+        listener = HotkeyListener("alt_r", lambda: seen.append("start"), on_end)
+        listener.start_dispatcher()
+        try:
+            listener._on_press(listener._key)
+            listener._on_release(listener._key)
+            self.assertTrue(done.wait(2.0))
+        finally:
+            listener.stop()
+
+        self.assertEqual(seen, ["start", "end"])
+
+    def test_callback_exception_does_not_kill_the_dispatch_thread(self):
+        done = threading.Event()
+
+        def boom():
+            raise RuntimeError("nope")
+
+        listener = HotkeyListener("alt_r", boom, done.set)
+        listener.start_dispatcher()
+        try:
+            listener._on_press(listener._key)    # raises inside the runner
+            listener._on_release(listener._key)  # must still be delivered
+            self.assertTrue(done.wait(2.0), "dispatch thread died on exception")
+        finally:
+            listener.stop()
+
+    def test_injected_runner_runs_synchronously(self):
+        rec = _Recorder()
+        listener = HotkeyListener("alt_r", rec.start, rec.end, runner=_direct)
+        listener._on_press(listener._key)
+        listener._on_release(listener._key)
+        self.assertEqual(rec.starts, 1)
+        self.assertEqual(rec.ends, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
