@@ -22,9 +22,29 @@ python3 -m venv .venv
 ./packaging/build.sh
 ```
 
-This produces `dist/Bomboclat Flow.app` and `dist/BomboclatFlow.dmg` (drag-to-Applications installer). On first launch the app guides you through the permissions (see below) and downloads the STT model (~2.3 GB, one time).
+This produces `dist/Bomboclat Flow.app` and `dist/BomboclatFlow.dmg`. On first launch the app guides you through the permissions (see below) and downloads the STT model (~2.3 GB, one time).
 
-**Signing note:** the build ad-hoc-signs by default, which makes macOS forget the app's permission grants on every rebuild. To keep grants stable across rebuilds, create a self-signed code-signing certificate named `BomboclatFlow Dev` (Keychain Access → Certificate Assistant → Create a Certificate → type "Code Signing") — `build.sh` picks it up automatically. Opening the app on *another* Mac requires System Settings → Privacy & Security → "Open Anyway" once (the app is not notarized).
+### Install from the DMG
+
+1. Open `dist/BomboclatFlow.dmg`.
+2. Drag **Bomboclat Flow.app** into **Applications**.
+3. **Eject the DMG** before launching — do not run the app from the mounted disk image.
+4. Start the app **only from `/Applications`** (Spotlight, Launchpad, or the Applications folder). Do not use `dist/Bomboclat Flow.app` for day-to-day use; a different install path can create duplicate or ineffective permission entries in System Settings.
+
+### Code signing (keep permissions across rebuilds)
+
+`build.sh` signs the app with a local certificate named **`BomboclatFlow Dev`** if it exists in your Keychain. Without it, the build falls back to **ad-hoc signing** and still completes — but macOS treats each rebuild as a new app and **forgets TCC permission grants** (Input Monitoring, Microphone, Accessibility) until you re-grant them.
+
+**One-time setup** (Keychain Access):
+
+1. Keychain Access → menu **Certificate Assistant** → **Create a Certificate…**
+2. Name: `BomboclatFlow Dev` (exact spelling)
+3. Identity type: **Code Signing**
+4. Create, then re-run `./packaging/build.sh` — you should see `signing with identity: BomboclatFlow Dev`.
+
+Why this matters: macOS binds privacy permissions to the app's **code signature**. Ad-hoc signing produces a new signature on every build; a stable dev certificate keeps the same identity so grants survive rebuilds.
+
+More detail: [`packaging/README.md`](packaging/README.md). Opening the app on *another* Mac still requires System Settings → Privacy & Security → **Open Anyway** once (the app is not notarized).
 
 ## Run from source (dev)
 

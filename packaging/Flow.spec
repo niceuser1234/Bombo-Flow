@@ -58,8 +58,9 @@ app = BUNDLE(
     icon=os.path.join(ROOT, "packaging", "BomboclatFlow.icns"),
     bundle_identifier="com.bomboclat.flow",
     info_plist={
-        # Menu bar agent: no Dock icon, no app switcher entry.
-        "LSUIElement": True,
+        # Deliberately NOT LSUIElement: an agent app owns no Dock icon, and
+        # macOS only offers Force Quit for apps that do. The menu bar icon
+        # stays either way.
         "LSMinimumSystemVersion": "14.0",
         "NSHighResolutionCapable": True,
         "NSMicrophoneUsageDescription":

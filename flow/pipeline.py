@@ -23,6 +23,8 @@ log = logging.getLogger(__name__)
 
 # States: loading, idle, recording, processing, error
 
+STOP_TIMEOUT_S = 2.0  # max seconds to wait for recorder.stop() before giving up.
+
 
 def _frontmost_app() -> str | None:
     try:
@@ -67,8 +69,12 @@ class Pipeline:
         self._press_time = 0.0
         self._max_timer: threading.Timer | None = None
         self._lock = threading.Lock()
+        self._stopping = False  # guard against concurrent finish+start
 
     def start(self):
+        # Build the native overlay before the first hotkey press so recording
+        # feedback appears immediately rather than paying AppKit setup cost.
+        self.overlay.prewarm()
         # Load, warm up, and run the model all on the single worker thread.
         # MLX streams are thread-local, so the model must be used on the same
         # thread it was created on — otherwise generate() raises
@@ -92,7 +98,13 @@ class Pipeline:
 
     def on_hold_start(self):
         with self._lock:
-            if self.engine is None or self.recorder.recording:
+            if self.engine is None:
+                return
+            if self.recorder.recording:
+                log.debug("on_hold_start skipped: already recording")
+                return
+            if self._stopping:
+                log.debug("on_hold_start skipped: _finish_recording in progress")
                 return
             self._press_time = time.monotonic()
             try:
@@ -124,8 +136,11 @@ class Pipeline:
         if self._max_timer:
             self._max_timer.cancel()
             self._max_timer = None
+        self._stopping = True
         duration = time.monotonic() - self._press_time
-        captured = self.recorder.stop()
+        captured = self._stop_recorder_safe()
+        self._stopping = False
+
         self.overlay.hide()
         if duration < self.cfg.min_duration_s:
             log.info("Discarding %.2fs tap", duration)
@@ -141,6 +156,47 @@ class Pipeline:
             return
         self.set_state("processing")
         self._queue.put((captured, time.monotonic()))
+
+    def _stop_recorder_safe(self) -> "np.ndarray":
+        """Stop the recorder off the calling thread, with a hard timeout.
+
+        CoreAudio can wedge inside AudioDeviceStop (its IO thread and the
+        stopping thread deadlock over the HAL locks). The stop therefore runs
+        on a throwaway thread: if it does not return in time we abandon that
+        thread along with its stream and swap in a fresh Recorder, so the next
+        dictation still works instead of finding `recording` stuck at True.
+
+        Returns the captured audio array, or zeros when the stop timed out.
+        """
+        import numpy as np
+
+        result: list[np.ndarray] = []
+        done = threading.Event()
+        stuck = self.recorder
+
+        def _stop():
+            try:
+                result.append(stuck.stop())
+            except Exception:
+                log.exception("recorder.stop() raised")
+            finally:
+                done.set()
+
+        stopper = threading.Thread(target=_stop, daemon=True, name="recorder-stop")
+        stopper.start()
+        if not done.wait(STOP_TIMEOUT_S):
+            log.warning(
+                "recorder.stop() did not return within %.1fs — CoreAudio is "
+                "stalled; abandoning the stream and rebuilding the recorder",
+                STOP_TIMEOUT_S,
+            )
+            # The overlay's level_source closes over `self`, so it follows the
+            # swap without further wiring.
+            self.recorder = Recorder()
+            return np.zeros(0, dtype=np.float32)
+        if result:
+            return result[0]
+        return np.zeros(0, dtype=np.float32)
 
     # -- worker --
 

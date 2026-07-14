@@ -5,9 +5,53 @@ Requires the Input Monitoring permission for the host process
 """
 
 import logging
+import queue
+import threading
+import time
 from pynput import keyboard
 
 log = logging.getLogger(__name__)
+
+DEBOUNCE_S = 0.05  # 50 ms gate for flags-changed (Fn) events.
+
+
+class SerialRunner:
+    """Runs submitted callables in order on one daemon thread.
+
+    The Fn monitor's handler is delivered on the AppKit main thread, so a
+    callback that blocks there blocks the whole UI. Worse than slow: starting
+    and stopping a CoreAudio stream from the main thread deadlocks against
+    CoreAudio's own IO thread (main holds the AudioUnit lock and waits for the
+    HAL IO lock; the IO thread holds the HAL IO lock and waits for the
+    AudioUnit lock). Handing the work to this thread keeps the main loop free.
+    """
+
+    def __init__(self, name="hotkey-dispatch"):
+        self._queue: queue.Queue = queue.Queue()
+        self._name = name
+        self._thread = None
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name=self._name
+        )
+        self._thread.start()
+
+    def __call__(self, func):
+        self._queue.put(func)
+
+    def stop(self):
+        self._queue.put(None)
+        self._thread = None
+
+    def _loop(self):
+        while True:
+            func = self._queue.get()
+            if func is None:
+                return
+            func()
 
 KEY_MAP = {
     "alt_r": keyboard.Key.alt_r,
@@ -71,21 +115,33 @@ class FnHotkeyListener:
     The monitor is passive: it cannot swallow Fn's default behaviour (emoji
     picker / input-source switch). Users disable that in System Settings →
     Keyboard → "Press 🌐 key to → Do Nothing".
+
+    The handler runs on the main thread, so it never calls the pipeline
+    directly — it only decides the press/release transition and submits the
+    callback to `runner`, which is a background thread by default.
     """
 
-    def __init__(self, on_hold_start, on_hold_end):
+    def __init__(self, on_hold_start, on_hold_end, runner=None):
         self._on_hold_start = on_hold_start
         self._on_hold_end = on_hold_end
         self._held = False
         self._monitor = None
+        self._last_event_time = 0.0
+        self._own_runner = runner is None
+        self._runner = runner if runner is not None else SerialRunner()
 
     def start(self):
         from AppKit import NSEvent, NSEventMaskFlagsChanged
 
+        self.start_dispatcher()
         self._monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
             NSEventMaskFlagsChanged, self._handle_event
         )
         log.info("Fn hotkey listener started")
+
+    def start_dispatcher(self):
+        if self._own_runner:
+            self._runner.start()
 
     def stop(self):
         if self._monitor is not None:
@@ -93,9 +149,16 @@ class FnHotkeyListener:
 
             NSEvent.removeMonitor_(self._monitor)
             self._monitor = None
+        if self._own_runner:
+            self._runner.stop()
 
     def _handle_event(self, event):
         from AppKit import NSEventModifierFlagFunction
+
+        now = time.monotonic()
+        if now - self._last_event_time < DEBOUNCE_S:
+            return
+        self._last_event_time = now
 
         fn_down = bool(event.modifierFlags() & NSEventModifierFlagFunction)
         self._dispatch(fn_down)
@@ -103,16 +166,17 @@ class FnHotkeyListener:
     def _dispatch(self, fn_down):
         if fn_down and not self._held:
             self._held = True
-            try:
-                self._on_hold_start()
-            except Exception:
-                log.exception("on_hold_start failed")
+            self._runner(lambda: self._safe_call(self._on_hold_start, "on_hold_start"))
         elif not fn_down and self._held:
             self._held = False
-            try:
-                self._on_hold_end()
-            except Exception:
-                log.exception("on_hold_end failed")
+            self._runner(lambda: self._safe_call(self._on_hold_end, "on_hold_end"))
+
+    @staticmethod
+    def _safe_call(callback, label):
+        try:
+            callback()
+        except Exception:
+            log.exception("%s failed", label)
 
 
 def make_listener(key_name, on_hold_start, on_hold_end):

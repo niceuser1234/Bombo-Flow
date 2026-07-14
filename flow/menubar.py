@@ -11,12 +11,22 @@ import subprocess
 import sys
 from pathlib import Path
 
+import objc
 import rumps
+from AppKit import NSApplication, NSApplicationActivationPolicyRegular
+from Foundation import NSDistributedNotificationCenter, NSObject
+from rumps import rumps as rumps_impl
 
 from . import config as config_mod
 from .cleanup import Cleaner, KEYCHAIN_SERVICE
 from .config import CONFIG_PATH, LOG_PATH, PROJECT_ROOT
 from .insert import accessibility_trusted
+from .lifecycle import (
+    WATCHDOG_INTERVAL_S,
+    OPEN_REQUEST_NOTIFICATION,
+    MainLoopWatchdog,
+    consume_open_request,
+)
 from .permissions import (
     PANE_ACCESSIBILITY,
     PANE_INPUT_MONITORING,
@@ -39,6 +49,32 @@ LAUNCH_AGENT_LABEL = "com.bomboclat.flow"
 LEGACY_AGENT_LABELS = ["io.julius.whisperflow", "com.whisperflow.app"]
 
 
+class _OpenRequestObserver(NSObject):
+    """Routes a second process' distributed open request to the dashboard."""
+
+    def initWithWindow_(self, window):
+        self = objc.super(_OpenRequestObserver, self).init()
+        if self is None:
+            return None
+        self._window = window
+        return self
+
+    def handleOpenRequest_(self, _notification):
+        self._window.show()
+
+
+class _FlowAppDelegate(rumps_impl.NSApp):
+    """rumps delegate extended with Finder/Dock reopen handling."""
+
+    def applicationShouldHandleReopen_hasVisibleWindows_(
+        self, _application, _has_visible_windows
+    ):
+        window = self._app.get("main_window")
+        if window is not None:
+            window.show()
+        return True
+
+
 def _agents_dir() -> Path:
     return Path.home() / "Library" / "LaunchAgents"
 
@@ -51,10 +87,10 @@ def _launch_agent_plist() -> bytes:
     """Build the LaunchAgent for however the app is currently running:
     the .app binary when frozen, `python -m flow` from a source checkout."""
     if config_mod.IS_FROZEN:
-        program_args = [sys.executable]
+        program_args = [sys.executable, "--background"]
         working_dir = None
     else:
-        program_args = [sys.executable, "-m", "flow"]
+        program_args = [sys.executable, "-m", "flow", "--background"]
         working_dir = str(PROJECT_ROOT)
     launchd_log = str(Path.home() / "Library" / "Logs" / "whisper-flow-launchd.log")
     payload = {
@@ -71,14 +107,35 @@ def _launch_agent_plist() -> bytes:
 
 
 class FlowApp(rumps.App):
-    def __init__(self, pipeline):
+    def __init__(self, pipeline, show_on_launch=False):
         super().__init__(
             "Bomboclat Flow", title=STATE_ICONS["loading"], quit_button=None
         )
+        # Regular (not Accessory/LSUIElement): macOS only lists apps that own a
+        # Dock icon in Force Quit, and a dictation app that can wedge must stay
+        # killable by hand. Costs a Dock icon, buys Cmd+Tab and Force Quit.
+        #
+        # sharedApplication() rather than the NSApp global: rumps only creates
+        # the shared instance in run(), so NSApp is still None here. This call
+        # creates it; rumps then picks up the very same instance.
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyRegular
+        )
+
         self.pipeline = pipeline
         self.main_window = MainWindow()
         self._pending_state = "loading"
         self._shown_state = None
+        self._notification_center = NSDistributedNotificationCenter.defaultCenter()
+        self._open_observer = _OpenRequestObserver.alloc().initWithWindow_(
+            self.main_window
+        )
+        self._notification_center.addObserver_selector_name_object_(
+            self._open_observer,
+            b"handleOpenRequest:",
+            OPEN_REQUEST_NOTIFICATION,
+            None,
+        )
 
         self.cleanup_item = rumps.MenuItem(
             "AI cleanup", callback=self._toggle_cleanup
@@ -105,10 +162,38 @@ class FlowApp(rumps.App):
         ]
 
         rumps.Timer(self._tick, 0.1).start()
+        self._open_request_path = (
+            config_mod.APP_SUPPORT / "open-dashboard.request"
+        )
+        self._open_request_timer = rumps.Timer(self._check_open_request, 0.2)
+        self._open_request_timer.start()
         # One-shot onboarding check shortly after launch, once the app is
         # registered with the window server (alerts need the run loop).
         self._onboarding_timer = rumps.Timer(self._onboarding, 1.5)
         self._onboarding_timer.start()
+        if show_on_launch:
+            self._launch_timer = rumps.Timer(self._show_initial_window, 0.35)
+            self._launch_timer.start()
+
+        # ― Emergency quit: Cmd+Alt+Shift+Q, for a responsive app.
+        self._install_emergency_quit()
+
+        # ― Main-loop watchdog: a daemon thread force-exits with a stack dump
+        #   when the main loop stops beating for >10 s. This is the only escape
+        #   from a wedged main thread — the menu, the hotkey and the emergency
+        #   shortcut all need that thread to be alive.
+        self._watchdog = MainLoopWatchdog()
+        self._watchdog.start()
+        rumps.Timer(self._beat, WATCHDOG_INTERVAL_S / 2).start()
+
+    def run(self, **options):
+        """Run rumps with our delegate subclass while preserving its machinery."""
+        original_delegate = rumps_impl.NSApp
+        rumps_impl.NSApp = _FlowAppDelegate
+        try:
+            return super().run(**options)
+        finally:
+            rumps_impl.NSApp = original_delegate
 
     # Called from any thread; a plain attribute write is atomic in CPython.
     def set_state(self, state):
@@ -118,6 +203,9 @@ class FlowApp(rumps.App):
         if self._pending_state != self._shown_state:
             self._shown_state = self._pending_state
             self.title = STATE_ICONS.get(self._shown_state, "🎤")
+
+    def _beat(self, _timer):
+        self._watchdog.beat()
 
     # -- cleanup / API key --
 
@@ -193,6 +281,14 @@ class FlowApp(rumps.App):
             if clicked == 1:
                 open_privacy_pane(PANE_INPUT_MONITORING)
 
+    def _show_initial_window(self, timer):
+        timer.stop()
+        self.main_window.show()
+
+    def _check_open_request(self, _timer):
+        if consume_open_request(self._open_request_path):
+            self.main_window.show()
+
     def _check_permissions(self, _item):
         im = "✓" if input_monitoring_granted() else "✗"
         ax = "✓" if accessibility_trusted(prompt=False) else "✗"
@@ -250,5 +346,49 @@ class FlowApp(rumps.App):
     def _open_log(self, _item):
         subprocess.run(["open", str(LOG_PATH)])
 
+    def _install_emergency_quit(self):
+        """Global Cmd+Alt+Shift+Q force-exits without going through the menu.
+
+        This only helps while the app still responds: global monitors are
+        delivered on the main thread, so a wedged main loop never runs this
+        handler. Recovering from that case is MainLoopWatchdog's job.
+        """
+        import logging as _logging
+        import os as _os
+        from AppKit import (
+            NSEvent,
+            NSEventMaskKeyDown,
+            NSEventModifierFlagCommand,
+            NSEventModifierFlagOption,
+            NSEventModifierFlagShift,
+        )
+
+        _log = _logging.getLogger(__name__)
+        _required_flags = int(
+            NSEventModifierFlagCommand
+            | NSEventModifierFlagOption
+            | NSEventModifierFlagShift
+        )
+
+        def _handle(event):
+            flags = int(event.modifierFlags())
+            if event.keyCode() != 12:  # key code for 'q'
+                return
+            if (flags & _required_flags) != _required_flags:
+                return
+            _log.warning("Emergency quit (Cmd+Alt+Shift+Q) — force-exiting")
+            _os._exit(1)
+
+        self._emergency_monitor = (
+            NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                NSEventMaskKeyDown, _handle
+            )
+        )
+        _log.info("Emergency quit handler installed (Cmd+Alt+Shift+Q)")
+
     def _quit(self, _item):
+        if hasattr(self, "_emergency_monitor") and self._emergency_monitor is not None:
+            from AppKit import NSEvent
+            NSEvent.removeMonitor_(self._emergency_monitor)
+        self._notification_center.removeObserver_(self._open_observer)
         rumps.quit_application()

@@ -13,6 +13,31 @@ log = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
 SILENCE_RMS = 1e-4  # below this the mic almost certainly delivered zeros
+LEVEL_GAIN = 12.0
+ATTACK_ALPHA = 0.82
+RELEASE_ALPHA = 0.18
+
+
+def _clamp01(value: float) -> float:
+    return 0.0 if value < 0.0 else (1.0 if value > 1.0 else value)
+
+
+def compute_normalized_level(indata: np.ndarray) -> float:
+    rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
+    return _clamp01(rms * LEVEL_GAIN)
+
+
+def apply_attack_release(
+    previous: float,
+    incoming: float,
+    attack: float = ATTACK_ALPHA,
+    release: float = RELEASE_ALPHA,
+) -> float:
+    prev = _clamp01(float(previous))
+    target = _clamp01(float(incoming))
+    alpha = attack if target >= prev else release
+    alpha = _clamp01(alpha)
+    return _clamp01(prev + alpha * (target - prev))
 
 
 class Recorder:
@@ -45,10 +70,9 @@ class Recorder:
         if status:
             log.warning("audio status: %s", status)
         self._chunks.append(indata.copy())
-        rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
-        new = min(1.0, rms * 12.0)
-        # Light smoothing so the waveform eases rather than jitters.
-        self.level = 0.6 * self.level + 0.4 * new
+        new = compute_normalized_level(indata)
+        # Fast attack + slower release: reacts immediately without jittering.
+        self.level = apply_attack_release(self.level, new)
 
     def stop(self) -> np.ndarray:
         """Stop recording and return the captured audio as 1-D float32."""
