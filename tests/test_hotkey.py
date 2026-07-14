@@ -98,14 +98,46 @@ class FnDispatchTests(unittest.TestCase):
                 return self._flags
 
         self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
-        # Release within the debounce window — ignored.
+        # Release within the debounce window — releases are never debounced,
+        # so this is delivered.
         self.listener._handle_event(FakeEvent(0))
-        # Another press within debounce — also ignored.
+        # Another press within debounce of the release — still swallowed.
         self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
-        # Only the first press took effect; release and second press were
-        # swallowed by the debounce gate.
         self.assertEqual(self.rec.starts, 1)
-        self.assertEqual(self.rec.ends, 0)
+        self.assertEqual(self.rec.ends, 1)
+
+    def test_release_is_never_debounced(self):
+        from AppKit import NSEventModifierFlagFunction
+
+        class FakeEvent:
+            def __init__(self, flags):
+                self._flags = flags
+
+            def modifierFlags(self):
+                return self._flags
+
+        # Press immediately followed by release, well inside DEBOUNCE_S.
+        self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
+        self.listener._handle_event(FakeEvent(0))
+        self.assertEqual(self.rec.starts, 1)
+        self.assertEqual(self.rec.ends, 1)
+
+    def test_press_within_debounce_of_release_is_swallowed(self):
+        from AppKit import NSEventModifierFlagFunction
+
+        class FakeEvent:
+            def __init__(self, flags):
+                self._flags = flags
+
+            def modifierFlags(self):
+                return self._flags
+
+        self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
+        self.listener._handle_event(FakeEvent(0))
+        # A press right after the release, still within DEBOUNCE_S, is gated.
+        self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
+        self.assertEqual(self.rec.starts, 1)
+        self.assertEqual(self.rec.ends, 1)
 
     def test_debounce_allows_event_after_timeout(self):
         from AppKit import NSEventModifierFlagFunction

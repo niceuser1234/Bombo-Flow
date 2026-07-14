@@ -12,7 +12,7 @@ from pynput import keyboard
 
 log = logging.getLogger(__name__)
 
-DEBOUNCE_S = 0.05  # 50 ms gate for flags-changed (Fn) events.
+DEBOUNCE_S = 0.05  # 50 ms gate suppressing duplicate press transitions only.
 
 
 class SerialRunner:
@@ -156,11 +156,10 @@ class FnHotkeyListener:
         from AppKit import NSEventModifierFlagFunction
 
         now = time.monotonic()
-        if now - self._last_event_time < DEBOUNCE_S:
+        fn_down = bool(event.modifierFlags() & NSEventModifierFlagFunction)
+        if fn_down and now - self._last_event_time < DEBOUNCE_S:
             return
         self._last_event_time = now
-
-        fn_down = bool(event.modifierFlags() & NSEventModifierFlagFunction)
         self._dispatch(fn_down)
 
     def _dispatch(self, fn_down):
