@@ -10,7 +10,7 @@ ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 datas, binaries, hiddenimports = [], [], []
 # Packages without ready-made PyInstaller hooks. mlx must bring its Metal
 # shader library (mlx/lib/mlx.metallib) or GPU inference dies at runtime.
-for pkg in ("mlx", "parakeet_mlx", "soxr"):
+for pkg in ("mlx", "parakeet_mlx", "soxr", "mlx_whisper"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
