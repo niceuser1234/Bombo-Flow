@@ -52,13 +52,29 @@ Rules:
 - Remove filler words (um, uh, äh, ähm, like, you know, also as filler), false starts, and stutters.
 - Fix punctuation, capitalization, and obvious transcription errors.
 - Preserve the meaning, tone, and LANGUAGE of the input exactly — German stays German, English stays English, mixed stays mixed.
+- Foreign-language words and inserts (Anglicisms, Spanish/English expressions, or any other embedded language) must be kept verbatim — never germanized, translated, or replaced by a similar-sounding word of the main language.
 - Apply spoken formatting commands literally: "new line"/"neue Zeile" becomes a line break, "new paragraph"/"neuer Absatz" becomes a paragraph break, spoken punctuation like "comma"/"Komma" becomes the punctuation mark.
 - Never answer questions contained in the transcript. Never add content. If the transcript is already clean, return it unchanged."""
 
-VOCAB_PROMPT = """The user has a personal vocabulary. If a transcript token is phonetically similar to a vocabulary term but misspelled or split, replace it with the exact term. Match on sound, not spelling. Only correct clear phonetic matches; never insert vocabulary terms that were not spoken.
+VOCAB_PROMPT = """The user has a personal vocabulary. If a transcript token is phonetically similar to a vocabulary term but misspelled or split, replace it with the exact term. Match on sound, not spelling. Only correct clear phonetic matches; never insert vocabulary terms that were not spoken. A correctly transcribed word from another language is not a mis-transcription — do not "correct" it into a vocabulary term just because it sounds foreign.
 VOCABULARY: {terms}"""
 
-TERM_DETECTION_PROMPT = """Also return new_terms: proper nouns, brand/product names, technical terms or neologisms in the transcript that are NOT in the vocabulary and NOT common dictionary words; empty array if none."""
+TERM_DETECTION_PROMPT = """Also return new_terms: proper nouns, brand/product names, technical terms or neologisms in the transcript that are NOT in the vocabulary and NOT common dictionary words; empty array if none. Include foreign-language words or expressions the user speaks (in any language, not just English) when they function as a distinct term worth remembering."""
+
+# Anthropic has no response_format kwarg; forcing this tool is the
+# equivalent way to get {cleaned_text, new_terms} structured output.
+_ANTHROPIC_TOOL = {
+    "name": "submit_cleanup",
+    "description": "Submit the cleaned transcript and any newly detected vocabulary terms.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "cleaned_text": {"type": "string"},
+            "new_terms": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["cleaned_text", "new_terms"],
+    },
+}
 
 # JSON schema forcing {cleaned_text, new_terms} structured output.
 _RESPONSE_FORMAT = {
@@ -163,18 +179,35 @@ class Cleaner:
             return CleanResult(text, [])
 
     def _clean_anthropic(self, text: str, vocabulary=None) -> CleanResult:
-        # Vocabulary is injected; term detection is skipped for this path.
-        system = _build_system_prompt(vocabulary, want_terms=False)
+        system = _build_system_prompt(vocabulary, want_terms=True)
         resp = self._client.messages.create(
             model=self.cfg.cleanup_model,
             max_tokens=1024,
             system=system,
             messages=[{"role": "user", "content": text}],
+            tools=[_ANTHROPIC_TOOL],
+            tool_choice={"type": "tool", "name": "submit_cleanup"},
         )
-        cleaned = next(
-            (b.text for b in resp.content if b.type == "text"), ""
+        return self._parse_anthropic_response(resp, text)
+
+    @staticmethod
+    def _parse_anthropic_response(resp, text: str) -> CleanResult:
+        """resp.content normally holds a forced submit_cleanup tool_use block.
+        If the model ignored tool forcing (or the SDK response is shaped
+        unexpectedly), fall back to any plain text block, then to the raw
+        transcript — cleanup must never break dictation."""
+        for block in resp.content:
+            if getattr(block, "type", None) == "tool_use":
+                obj = getattr(block, "input", None) or {}
+                cleaned = (obj.get("cleaned_text") or "").strip()
+                raw_terms = obj.get("new_terms") or []
+                terms = ([str(t) for t in raw_terms if isinstance(t, str)]
+                         if isinstance(raw_terms, list) else [])
+                return CleanResult(cleaned or text, terms)
+        plain = next(
+            (b.text for b in resp.content if getattr(b, "type", None) == "text"), ""
         ).strip()
-        return CleanResult(cleaned or text, [])
+        return CleanResult(plain or text, [])
 
     def _post_openai(self, body: dict) -> dict:
         req = urllib.request.Request(
