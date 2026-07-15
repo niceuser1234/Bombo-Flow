@@ -9,12 +9,16 @@ synthetic event and turn it into Option+Cmd+V.
 """
 
 import logging
+import threading
 import time
 
 import Quartz
-from AppKit import NSPasteboard, NSPasteboardTypeString
+from AppKit import NSPasteboard, NSPasteboardTypeString, NSThread
+from PyObjCTools import AppHelper
 
 log = logging.getLogger(__name__)
+
+_ON_MAIN_TIMEOUT_S = 1.0
 
 
 def accessibility_trusted(prompt: bool = False) -> bool:
@@ -67,22 +71,68 @@ def _wait_modifiers_released(timeout: float = 1.5):
     log.warning("Modifier keys still held after %.1fs — pasting anyway", timeout)
 
 
-def _paste_text(text: str):
-    pb = NSPasteboard.generalPasteboard()
-    old = pb.stringForType_(NSPasteboardTypeString)
+def _on_main(func, timeout=None):
+    """Run func() on the main thread and return its result.
 
-    pb.clearContents()
-    pb.setString_forType_(text, NSPasteboardTypeString)
-    our_change = pb.changeCount()
+    AppKit's NSPasteboard is only supported from the main thread, but
+    _paste_text runs on the pipeline worker thread. When already on the
+    main thread, run inline; otherwise marshal the call over via
+    PyObjCTools.AppHelper.callAfter and block (with a timeout) on a
+    threading.Event for the result.
+    """
+    if NSThread.isMainThread():
+        return func()
+
+    if timeout is None:
+        timeout = _ON_MAIN_TIMEOUT_S
+
+    result = []
+    done = threading.Event()
+
+    def run():
+        try:
+            result.append(func())
+        finally:
+            done.set()
+
+    AppHelper.callAfter(run)
+    if not done.wait(timeout):
+        raise TimeoutError(f"main thread did not respond within {timeout:.1f}s")
+    return result[0]
+
+
+def _paste_text(text: str):
+    def save_and_set():
+        pb = NSPasteboard.generalPasteboard()
+        old = pb.stringForType_(NSPasteboardTypeString)
+        pb.clearContents()
+        pb.setString_forType_(text, NSPasteboardTypeString)
+        return old, pb.changeCount()
+
+    try:
+        old, our_change = _on_main(save_and_set)
+    except TimeoutError:
+        # A wedged main thread means we can't safely save/restore the
+        # clipboard — pasting a stale one is worse than not pasting.
+        log.warning("Main thread unresponsive — skipping paste")
+        return
 
     time.sleep(0.05)  # let the pasteboard settle before the app reads it
     _post_cmd_v()
 
     # Restore the previous clipboard, unless something else wrote meanwhile.
     time.sleep(0.3)
-    if old is not None and pb.changeCount() == our_change:
-        pb.clearContents()
-        pb.setString_forType_(old, NSPasteboardTypeString)
+
+    def restore():
+        pb = NSPasteboard.generalPasteboard()
+        if old is not None and pb.changeCount() == our_change:
+            pb.clearContents()
+            pb.setString_forType_(old, NSPasteboardTypeString)
+
+    try:
+        _on_main(restore)
+    except TimeoutError:
+        log.warning("Main thread unresponsive — could not restore previous clipboard")
 
 
 def _post_cmd_v():
