@@ -167,7 +167,10 @@ class Store:
         Feeds the usage-ordering of dictionary_words() (prompt biasing) and
         the least-used eviction in _make_room_for_auto_entry(). The IN
         comparison inherits the column's COLLATE NOCASE, so matching is
-        case-insensitive like the primary key itself."""
+        case-insensitive like the primary key itself. Each term counts once
+        per dictation regardless of how many times it occurs in the text —
+        callers pass a de-duplicated list of terms present, not per-occurrence
+        counts."""
         if not words:
             return
         placeholders = ", ".join("?" for _ in words)

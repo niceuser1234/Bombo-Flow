@@ -106,6 +106,12 @@ class Pipeline:
 
     def _load_model(self) -> bool:
         self.set_state("loading")
+        if self.cfg.engine == "whisper":
+            log.info(
+                "Loading Whisper engine (%s) — first run downloads the model "
+                "(~1.6 GB) from Hugging Face, which can take a few minutes",
+                self.cfg.whisper_model,
+            )
         try:
             self.engine = stt.create_engine(self.cfg)
             self.engine.warmup()
