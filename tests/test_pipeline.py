@@ -65,6 +65,7 @@ class _Config:
 class _FakeStore:
     def __init__(self, words=None):
         self._words = words or []
+        self.bumped = []
 
     def dictionary_words(self):
         return list(self._words)
@@ -74,6 +75,9 @@ class _FakeStore:
 
     def record_candidates(self, terms):
         return []
+
+    def bump_uses(self, words):
+        self.bumped.append(list(words))
 
 
 def _build_pipeline():
@@ -271,15 +275,25 @@ class BuildInitialPromptTests(unittest.TestCase):
     def test_empty_vocabulary_yields_no_prompt(self):
         self.assertIsNone(_build_initial_prompt([]))
 
-    def test_prompt_contains_terms_and_stays_capped(self):
+    def test_prompt_uses_only_top_terms(self):
         many_terms = [f"Begriff{i}xyz" for i in range(50)]
         prompt = _build_initial_prompt(many_terms)
         self.assertIsNotNone(prompt)
-        self.assertLessEqual(len(prompt), 800)
         self.assertIn("Begriff0xyz", prompt)
         # Only the top ~30 terms are used, so a term far down the
-        # usage-ordered list should not appear.
+        # usage-ordered list must not appear.
         self.assertNotIn("Begriff49xyz", prompt)
+
+    def test_prompt_is_truncated_at_char_cap(self):
+        # 30 terms x 40 chars comfortably exceeds the 800-char cap, so the
+        # slice must actually fire.
+        long_terms = [f"Term{i:02d}" + "x" * 34 for i in range(30)]
+        untruncated = "Vokabular: " + ", ".join(long_terms)
+        self.assertGreater(len(untruncated), 800)
+
+        prompt = _build_initial_prompt(long_terms)
+        self.assertEqual(len(prompt), 800)
+        self.assertEqual(prompt, untruncated[:800])
 
 
 class InitialPromptTests(unittest.TestCase):
@@ -301,6 +315,27 @@ class InitialPromptTests(unittest.TestCase):
     def test_transcribe_receives_no_prompt_when_dictionary_empty(self):
         prompt = self._run([])
         self.assertIsNone(prompt)
+
+
+class UsageBumpTests(unittest.TestCase):
+    def _run(self, words, spoken):
+        pipeline = _build_pipeline()
+        pipeline.engine = _RecordingEngine(text=spoken)
+        store = _FakeStore(words)
+        with patch("flow.pipeline.get_store", return_value=store), \
+                patch("flow.pipeline.insert_text"), \
+                patch("flow.pipeline._frontmost_app", return_value="TestApp"):
+            pipeline._process(np.zeros(100, dtype=np.float32), time.monotonic())
+        return store
+
+    def test_terms_in_final_text_get_their_uses_bumped(self):
+        store = self._run(["Kubernetes", "München"],
+                          spoken="wir deployen auf kubernetes heute")
+        self.assertEqual(store.bumped, [["Kubernetes"]])
+
+    def test_no_bump_when_no_term_appears(self):
+        store = self._run(["Kubernetes"], spoken="hallo welt wie geht es")
+        self.assertEqual(store.bumped, [])
 
 
 if __name__ == "__main__":

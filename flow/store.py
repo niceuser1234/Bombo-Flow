@@ -162,6 +162,23 @@ class Store:
             )
             self._conn.commit()
 
+    def bump_uses(self, words: list[str]) -> None:
+        """Increment the usage counter of words that appeared in a dictation.
+        Feeds the usage-ordering of dictionary_words() (prompt biasing) and
+        the least-used eviction in _make_room_for_auto_entry(). The IN
+        comparison inherits the column's COLLATE NOCASE, so matching is
+        case-insensitive like the primary key itself."""
+        if not words:
+            return
+        placeholders = ", ".join("?" for _ in words)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE dictionary SET uses = uses + 1 "
+                f"WHERE word IN ({placeholders})",
+                words,
+            )
+            self._conn.commit()
+
     def delete_word(self, word: str) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM dictionary WHERE word = ?", (word,))

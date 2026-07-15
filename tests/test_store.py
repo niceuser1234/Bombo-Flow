@@ -68,14 +68,26 @@ def test_candidate_promoted_to_dictionary_after_single_sighting():
 
 
 def test_dictionary_words_ordered_by_usage():
+    """Ordering must come from the real usage path (bump_uses), not from
+    hand-edited rows — every dictation containing a term bumps its counter."""
     with tempfile.TemporaryDirectory() as tmp:
         store = Store(db_path=Path(tmp) / "store.db")
         store.add_word("Rare")
         store.add_word("Common")
-        with store._lock:
-            store._conn.execute(
-                "UPDATE dictionary SET uses = 5 WHERE word = 'Common'"
-            )
-            store._conn.commit()
+
+        store.bump_uses(["Common"])
+        store.bump_uses(["Common"])
 
         assert store.dictionary_words() == ["Common", "Rare"]
+
+
+def test_bump_uses_is_case_insensitive_and_ignores_empty():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Store(db_path=Path(tmp) / "store.db")
+        store.add_word("Alpha")
+        store.add_word("Kubernetes")
+
+        store.bump_uses([])  # no-op, must not raise
+        store.bump_uses(["kubernetes"])  # NOCASE primary key must match
+
+        assert store.dictionary_words() == ["Kubernetes", "Alpha"]

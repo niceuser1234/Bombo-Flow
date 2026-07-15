@@ -47,12 +47,18 @@ def _words_changed(raw: str, cleaned: str) -> int:
     return changed
 
 
+def _terms_in(vocabulary: list[str], text: str) -> list[str]:
+    """Vocabulary terms that appear (case-insensitively) in text."""
+    text_l = text.lower()
+    return [t for t in vocabulary if t.lower() in text_l]
+
+
 def _dict_fixes(vocabulary: list[str], raw: str, cleaned: str) -> int:
     """Vocabulary terms that appear in the cleaned text but not in the raw
     transcript — i.e. corrections the dictionary is responsible for."""
     raw_l = raw.lower()
     return sum(
-        1 for t in vocabulary if t in cleaned and t.lower() not in raw_l
+        1 for t in _terms_in(vocabulary, cleaned) if t.lower() not in raw_l
     )
 
 
@@ -264,6 +270,9 @@ class Pipeline:
                 corrected_words=_words_changed(raw, text),
                 dict_fixes=_dict_fixes(vocabulary, raw, text),
             )
+            used = _terms_in(vocabulary, text)
+            if used:
+                store.bump_uses(used)
             if new_terms:
                 accepted = filter_candidates(new_terms, vocabulary)
                 promoted = store.record_candidates(accepted)
