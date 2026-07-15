@@ -321,10 +321,15 @@ class Store:
 
 
 _store: Store | None = None
+_store_lock = threading.Lock()
 
 
 def get_store() -> Store:
     global _store
+    # Fast path: reference read/assignment is GIL-atomic, so once _store is
+    # set this never touches the lock.
     if _store is None:
-        _store = Store()
+        with _store_lock:
+            if _store is None:
+                _store = Store()
     return _store
