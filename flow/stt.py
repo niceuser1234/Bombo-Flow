@@ -25,7 +25,9 @@ class ParakeetEngine:
     def warmup(self):
         self.transcribe(np.zeros(16000, dtype=np.float32))
 
-    def transcribe(self, audio: np.ndarray) -> str:
+    def transcribe(self, audio: np.ndarray, initial_prompt: str | None = None) -> str:
+        # initial_prompt is accepted for call-site uniformity with
+        # WhisperEngine but ignored — parakeet-mlx has no biasing hook.
         import mlx.core as mx
         from parakeet_mlx.audio import get_logmel
 
@@ -46,10 +48,12 @@ class WhisperEngine:
     def warmup(self):
         self.transcribe(np.zeros(16000, dtype=np.float32))
 
-    def transcribe(self, audio: np.ndarray) -> str:
+    def transcribe(self, audio: np.ndarray, initial_prompt: str | None = None) -> str:
         import mlx_whisper
 
-        result = mlx_whisper.transcribe(audio, path_or_hf_repo=self.model_id)
+        result = mlx_whisper.transcribe(
+            audio, path_or_hf_repo=self.model_id, initial_prompt=initial_prompt
+        )
         return result["text"].strip()
 
 

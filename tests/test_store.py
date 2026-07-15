@@ -3,7 +3,7 @@ import threading
 from pathlib import Path
 
 import flow.store as store_mod
-from flow.store import get_store
+from flow.store import Store, get_store
 
 
 def test_get_store_is_thread_safe_singleton():
@@ -52,3 +52,30 @@ def test_get_store_is_thread_safe_singleton():
                 store_mod.Store = orig_store_cls
     finally:
         store_mod._store = None
+
+
+def test_candidate_promoted_to_dictionary_after_single_sighting():
+    """PROMOTE_AT = 1: a candidate term must land in the dictionary — and
+    therefore start biasing STT/cleanup — after the very first sighting,
+    not the second."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Store(db_path=Path(tmp) / "store.db")
+
+        promoted = store.record_candidates(["Kubernetes"])
+
+        assert promoted == ["Kubernetes"]
+        assert "Kubernetes" in store.dictionary_words()
+
+
+def test_dictionary_words_ordered_by_usage():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Store(db_path=Path(tmp) / "store.db")
+        store.add_word("Rare")
+        store.add_word("Common")
+        with store._lock:
+            store._conn.execute(
+                "UPDATE dictionary SET uses = 5 WHERE word = 'Common'"
+            )
+            store._conn.commit()
+
+        assert store.dictionary_words() == ["Common", "Rare"]

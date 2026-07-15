@@ -21,7 +21,11 @@ from flow.config import APP_SUPPORT
 log = logging.getLogger(__name__)
 
 AUTO_DICT_CAP = 400
-PROMOTE_AT = 2
+# A candidate term is promoted to the dictionary the first time it is seen,
+# so the STT/cleanup bias from a learned term is active from the very next
+# dictation. Staging is still populated/cleared on the way through so the
+# bookkeeping stays uniform if this is ever raised again.
+PROMOTE_AT = 1
 
 
 def _utcnow() -> str:
@@ -142,9 +146,11 @@ class Store:
         return [{"word": r["word"], "auto": bool(r["auto"]), "added_ts": r["added_ts"]} for r in rows]
 
     def dictionary_words(self) -> list[str]:
+        """Words ordered by usage (most-used first), for prompt injection —
+        biasing STT and the cleanup LLM towards the terms that matter most."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT word FROM dictionary ORDER BY word COLLATE NOCASE"
+                "SELECT word FROM dictionary ORDER BY uses DESC, added_ts DESC"
             ).fetchall()
         return [r["word"] for r in rows]
 

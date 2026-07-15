@@ -56,6 +56,22 @@ def _dict_fixes(vocabulary: list[str], raw: str, cleaned: str) -> int:
     )
 
 
+INITIAL_PROMPT_TERM_LIMIT = 30
+INITIAL_PROMPT_MAX_CHARS = 800
+
+
+def _build_initial_prompt(vocabulary: list[str]) -> str | None:
+    """Bias STT towards learned dictionary terms (foreign words, proper
+    nouns) via Whisper's initial_prompt. Top terms only (vocabulary is
+    usage-ordered) and capped in length — initial_prompt is not meant for
+    long text and an oversized prompt can hurt more than it helps."""
+    if not vocabulary:
+        return None
+    terms = vocabulary[:INITIAL_PROMPT_TERM_LIMIT]
+    prompt = "Vokabular: " + ", ".join(terms)
+    return prompt[:INITIAL_PROMPT_MAX_CHARS]
+
+
 class Pipeline:
     def __init__(self, cfg, set_state):
         self.cfg = cfg
@@ -222,15 +238,17 @@ class Pipeline:
                     self.set_state("idle")
 
     def _process(self, captured, released_at):
-        raw = self.engine.transcribe(captured)
+        store = get_store()
+        vocabulary = store.dictionary_words()
+        raw = self.engine.transcribe(
+            captured, initial_prompt=_build_initial_prompt(vocabulary)
+        )
         t_stt = time.monotonic()
         log.info("STT (%.2fs): %r", t_stt - released_at, raw)
         if not raw:
             return
-        store = get_store()
-        text, new_terms, vocabulary = raw, [], []
+        text, new_terms = raw, []
         if self.cleanup_enabled:
-            vocabulary = store.dictionary_words()
             result = self.cleaner.clean(raw, vocabulary=vocabulary)
             text, new_terms = result.text, result.new_terms
             log.info("Cleaned (%.2fs): %r", time.monotonic() - t_stt, text)

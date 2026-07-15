@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from flow.pipeline import STOP_TIMEOUT_S, Pipeline
+from flow.pipeline import STOP_TIMEOUT_S, Pipeline, _build_initial_prompt
 
 
 class _Overlay:
@@ -59,6 +59,21 @@ class _Config:
     cleanup_model = "test"
     cleanup_timeout_s = 5.0
     cleanup_min_words = 4
+    insert_mode = "paste"
+
+
+class _FakeStore:
+    def __init__(self, words=None):
+        self._words = words or []
+
+    def dictionary_words(self):
+        return list(self._words)
+
+    def add_dictation(self, *args, **kwargs):
+        pass
+
+    def record_candidates(self, terms):
+        return []
 
 
 def _build_pipeline():
@@ -240,6 +255,52 @@ class LockNotHeldAcrossStopTests(unittest.TestCase):
         t.join(timeout=5.0)
         self.assertFalse(t.is_alive())
         self.assertFalse(pipeline._stopping)
+
+
+class _RecordingEngine:
+    def __init__(self, text="hallo"):
+        self.text = text
+        self.calls = []
+
+    def transcribe(self, audio, initial_prompt=None):
+        self.calls.append(initial_prompt)
+        return self.text
+
+
+class BuildInitialPromptTests(unittest.TestCase):
+    def test_empty_vocabulary_yields_no_prompt(self):
+        self.assertIsNone(_build_initial_prompt([]))
+
+    def test_prompt_contains_terms_and_stays_capped(self):
+        many_terms = [f"Begriff{i}xyz" for i in range(50)]
+        prompt = _build_initial_prompt(many_terms)
+        self.assertIsNotNone(prompt)
+        self.assertLessEqual(len(prompt), 800)
+        self.assertIn("Begriff0xyz", prompt)
+        # Only the top ~30 terms are used, so a term far down the
+        # usage-ordered list should not appear.
+        self.assertNotIn("Begriff49xyz", prompt)
+
+
+class InitialPromptTests(unittest.TestCase):
+    def _run(self, words):
+        pipeline = _build_pipeline()
+        pipeline.engine = _RecordingEngine()
+        with patch("flow.pipeline.get_store", return_value=_FakeStore(words)), \
+                patch("flow.pipeline.insert_text"), \
+                patch("flow.pipeline._frontmost_app", return_value="TestApp"):
+            pipeline._process(np.zeros(100, dtype=np.float32), time.monotonic())
+        return pipeline.engine.calls[0]
+
+    def test_transcribe_receives_prompt_with_dictionary_terms(self):
+        prompt = self._run(["Kubernetes", "München"])
+        self.assertIsNotNone(prompt)
+        self.assertIn("Kubernetes", prompt)
+        self.assertIn("München", prompt)
+
+    def test_transcribe_receives_no_prompt_when_dictionary_empty(self):
+        prompt = self._run([])
+        self.assertIsNone(prompt)
 
 
 if __name__ == "__main__":
