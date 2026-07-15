@@ -335,16 +335,27 @@ class BuildInitialPromptTests(unittest.TestCase):
         # usage-ordered list must not appear.
         self.assertNotIn("Begriff49xyz", prompt)
 
-    def test_prompt_is_truncated_at_char_cap(self):
-        # 30 terms x 40 chars comfortably exceeds the 800-char cap, so the
-        # slice must actually fire.
+    def test_prompt_has_no_language_prefix(self):
+        prompt = _build_initial_prompt(["Kubernetes", "München"])
+        self.assertEqual(prompt, "Kubernetes, München")
+
+    def test_prompt_is_truncated_at_last_full_term(self):
+        # 30 terms x 40 chars comfortably exceeds the 800-char cap, so
+        # truncation must actually fire — and it must land on a term
+        # boundary rather than slicing a term in half.
         long_terms = [f"Term{i:02d}" + "x" * 34 for i in range(30)]
-        untruncated = "Vokabular: " + ", ".join(long_terms)
-        self.assertGreater(len(untruncated), 800)
+        full = ", ".join(long_terms)
+        self.assertGreater(len(full), 800)
 
         prompt = _build_initial_prompt(long_terms)
-        self.assertEqual(len(prompt), 800)
-        self.assertEqual(prompt, untruncated[:800])
+        self.assertLessEqual(len(prompt), 800)
+        # 19 full terms (42 chars each incl. separator, minus the trailing
+        # separator) fit under the cap; the 20th would push it over.
+        expected = ", ".join(long_terms[:19])
+        self.assertEqual(prompt, expected)
+        self.assertGreater(len(", ".join(long_terms[:20])), 800)
+        # No term is cut mid-way: every comma-separated piece is a full term.
+        self.assertTrue(all(piece in long_terms for piece in prompt.split(", ")))
 
 
 class InitialPromptTests(unittest.TestCase):

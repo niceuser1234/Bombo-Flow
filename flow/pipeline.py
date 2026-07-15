@@ -71,12 +71,22 @@ def _build_initial_prompt(vocabulary: list[str]) -> str | None:
     """Bias STT towards learned dictionary terms (foreign words, proper
     nouns) via Whisper's initial_prompt. Top terms only (vocabulary is
     usage-ordered) and capped in length — initial_prompt is not meant for
-    long text and an oversized prompt can hurt more than it helps."""
+    long text and an oversized prompt can hurt more than it helps.
+
+    No language prefix (dictations mix German/English/other languages, and a
+    German "Vokabular:" label would itself bias the model). If the joined
+    terms exceed the cap, truncate at the last full term rather than
+    mid-term — a half-written term is more likely to confuse the model than
+    to help it."""
     if not vocabulary:
         return None
     terms = vocabulary[:INITIAL_PROMPT_TERM_LIMIT]
-    prompt = "Vokabular: " + ", ".join(terms)
-    return prompt[:INITIAL_PROMPT_MAX_CHARS]
+    prompt = ", ".join(terms)
+    if len(prompt) <= INITIAL_PROMPT_MAX_CHARS:
+        return prompt
+    truncated = prompt[:INITIAL_PROMPT_MAX_CHARS]
+    cut = truncated.rfind(", ")
+    return truncated[:cut] if cut != -1 else truncated
 
 
 class Pipeline:
