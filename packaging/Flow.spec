@@ -24,6 +24,11 @@ for f in glob.glob(os.path.join(ROOT, "flow", "ui", "*")):
     if os.path.isfile(f):
         datas.append((f, "flow/ui"))
 
+# Recording start/stop blips (loaded by flow/sound.py via _MEIPASS/flow/ui/assets).
+for f in glob.glob(os.path.join(ROOT, "flow", "ui", "assets", "*")):
+    if os.path.isfile(f):
+        datas.append((f, "flow/ui/assets"))
+
 a = Analysis(
     [os.path.join(ROOT, "packaging", "launcher.py")],
     pathex=[ROOT],

@@ -60,6 +60,7 @@ class _Config:
     cleanup_timeout_s = 5.0
     cleanup_min_words = 4
     insert_mode = "paste"
+    sounds = True
 
 
 class _FakeStore:
@@ -128,6 +129,56 @@ class HoldStartGuardTests(unittest.TestCase):
         pipeline.engine = None
         pipeline.on_hold_start()
         self.assertFalse(pipeline.recorder.recording)
+
+
+class SoundHookTests(unittest.TestCase):
+    def test_start_sound_plays_after_successful_recorder_start(self):
+        pipeline = _build_pipeline()
+        pipeline.engine = True
+        with patch("flow.pipeline.sound.play_start") as play_start:
+            pipeline.on_hold_start()
+        play_start.assert_called_once_with()
+
+    def test_start_sound_not_played_when_recorder_start_fails(self):
+        pipeline = _build_pipeline()
+        pipeline.engine = True
+        pipeline.recorder.start = lambda: (_ for _ in ()).throw(RuntimeError("mic busy"))
+        with patch("flow.pipeline.sound.play_start") as play_start:
+            pipeline.on_hold_start()
+        play_start.assert_not_called()
+
+    def test_start_sound_not_played_when_sounds_disabled(self):
+        pipeline = _build_pipeline()
+        pipeline.engine = True
+        pipeline.cfg.sounds = False
+        with patch("flow.pipeline.sound.play_start") as play_start:
+            pipeline.on_hold_start()
+        play_start.assert_not_called()
+
+    def test_stop_sound_plays_after_recorder_stops(self):
+        pipeline = _build_pipeline()
+        pipeline.recorder._recording = True
+        with patch("flow.pipeline.sound.play_stop") as play_stop:
+            pipeline._finish_recording()
+        play_stop.assert_called_once_with()
+
+    def test_stop_sound_not_played_when_sounds_disabled(self):
+        pipeline = _build_pipeline()
+        pipeline.recorder._recording = True
+        pipeline.cfg.sounds = False
+        with patch("flow.pipeline.sound.play_stop") as play_stop:
+            pipeline._finish_recording()
+        play_stop.assert_not_called()
+
+    def test_stop_sound_plays_even_for_discarded_short_tap(self):
+        """The stop blip is 'you released the key' feedback, independent of
+        whether the tap turns out too short to process."""
+        pipeline = _build_pipeline()
+        pipeline.recorder._recording = True
+        pipeline._press_time = time.monotonic()  # ~0s elapsed < min_duration_s
+        with patch("flow.pipeline.sound.play_stop") as play_stop:
+            pipeline._finish_recording()
+        play_stop.assert_called_once_with()
 
 
 class RecorderStopTimeoutTests(unittest.TestCase):

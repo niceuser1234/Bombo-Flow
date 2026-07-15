@@ -44,6 +44,7 @@ class Config:
     cleanup_min_words: int = 4
     cleanup_timeout_s: float = 5.0
     insert_mode: str = "paste"
+    sounds: bool = True
 
 
 def load() -> Config:
@@ -65,6 +66,7 @@ def load() -> Config:
     cfg.hotkey = hotkey.get("key", cfg.hotkey)
     cfg.min_duration_s = float(audio.get("min_duration_s", cfg.min_duration_s))
     cfg.max_duration_s = float(audio.get("max_duration_s", cfg.max_duration_s))
+    cfg.sounds = bool(audio.get("sounds", cfg.sounds))
     cfg.engine = stt.get("engine", cfg.engine)
     cfg.parakeet_model = stt.get("parakeet_model", cfg.parakeet_model)
     cfg.whisper_model = stt.get("whisper_model", cfg.whisper_model)

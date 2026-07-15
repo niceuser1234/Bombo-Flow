@@ -16,6 +16,8 @@ key = "fn"
 min_duration_s = 0.3
 # Recordings are force-stopped after this many seconds.
 max_duration_s = 120
+# Play a subtle start/stop blip when recording begins/ends.
+sounds = true
 
 [stt]
 # "whisper" (recommended, better with mixed-language utterances, requires:

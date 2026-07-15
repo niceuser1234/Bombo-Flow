@@ -11,6 +11,7 @@ import threading
 import time
 
 from . import audio as audio_mod
+from . import sound
 from . import stt
 from .audio import Recorder
 from .cleanup import Cleaner
@@ -135,6 +136,8 @@ class Pipeline:
                 log.exception("Could not start recording (mic in use?)")
                 self.set_state("error")
                 return
+            if self.cfg.sounds:
+                sound.play_start()
             self.set_state("recording")
             self.overlay.show()
             self._max_timer = threading.Timer(
@@ -164,6 +167,8 @@ class Pipeline:
         # press would then stomp. The blocking stop still runs lock-free.
         try:
             captured = self._stop_recorder_safe()
+            if self.cfg.sounds:
+                sound.play_stop()
 
             self.overlay.hide()
             if duration < self.cfg.min_duration_s:
