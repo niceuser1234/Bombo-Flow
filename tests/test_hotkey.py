@@ -81,8 +81,7 @@ class FnDispatchTests(unittest.TestCase):
                 return self._flags
 
         self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
-        # Skip past the debounce window so the release is accepted.
-        self.listener._last_event_time = 0.0
+        # Releases are never debounced, so this is delivered immediately.
         self.listener._handle_event(FakeEvent(0))
         self.assertEqual(self.rec.starts, 1)
         self.assertEqual(self.rec.ends, 1)
@@ -325,6 +324,42 @@ class PynputRunsOffMainThreadTests(unittest.TestCase):
         listener._on_release(listener._key)
         self.assertEqual(rec.starts, 1)
         self.assertEqual(rec.ends, 1)
+
+    def test_stop_joins_listener_before_stopping_runner(self):
+        # pynput's Listener.stop() does not wait for its thread, so a
+        # callback submission can still be mid-flight when stop() returns.
+        # stop() must join the listener thread before stopping the runner,
+        # or the SerialRunner None sentinel overtakes the in-flight
+        # submission and the final callback is silently dropped.
+        done = threading.Event()
+        listener = HotkeyListener("alt_r", done.set, lambda: None)
+        listener.start_dispatcher()
+
+        class FakeListenerThread:
+            def __init__(self, on_join):
+                self.calls = []
+                self._on_join = on_join
+
+            def stop(self):
+                self.calls.append("stop")
+
+            def is_alive(self):
+                return True
+
+            def join(self, timeout=None):
+                self.calls.append("join")
+                self._on_join()  # in-flight _on_press lands during the join
+
+        fake = FakeListenerThread(
+            on_join=lambda: listener._on_press(listener._key)
+        )
+        listener._listener = fake
+        listener.stop()
+
+        self.assertEqual(fake.calls, ["stop", "join"])
+        self.assertTrue(
+            done.wait(2.0), "in-flight callback was dropped by runner shutdown"
+        )
 
 
 if __name__ == "__main__":

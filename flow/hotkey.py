@@ -110,6 +110,15 @@ class HotkeyListener:
     def stop(self):
         if self._listener:
             self._listener.stop()
+            # pynput's stop() does not wait for the listener thread, so an
+            # _on_press/_on_release may still be mid-flight. Join it before
+            # stopping the runner: the None sentinel must not overtake an
+            # in-flight callback submission (pynput's Listener is a Thread).
+            try:
+                if self._listener.is_alive():
+                    self._listener.join(timeout=1.0)
+            except Exception:
+                log.exception("joining hotkey listener thread failed")
         if self._own_runner:
             self._runner.stop()
 
