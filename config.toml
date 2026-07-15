@@ -18,9 +18,10 @@ min_duration_s = 0.3
 max_duration_s = 120
 
 [stt]
-# "parakeet" (recommended, fast + multilingual) or "whisper" (requires: pip install mlx-whisper)
-engine = "parakeet"
-parakeet_model = "mlx-community/parakeet-tdt-0.6b-v3"
+# "whisper" (recommended, better with mixed-language utterances, requires:
+# pip install mlx-whisper) or "parakeet" (faster, but single-language-per-utterance).
+engine = "whisper"
+# parakeet_model = "mlx-community/parakeet-tdt-0.6b-v3"
 whisper_model = "mlx-community/whisper-large-v3-turbo"
 
 [cleanup]
