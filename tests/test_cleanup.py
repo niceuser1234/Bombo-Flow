@@ -120,5 +120,13 @@ class AnthropicParseTests(unittest.TestCase):
         self.assertEqual(result.new_terms, [])
 
 
+class ListFormattingPromptTests(unittest.TestCase):
+    def test_system_prompt_instructs_list_formatting(self):
+        from flow.cleanup import SYSTEM_PROMPT
+        self.assertIn('"- "', SYSTEM_PROMPT)
+        self.assertIn("erstens", SYSTEM_PROMPT)
+        self.assertIn("NEVER be reformatted", SYSTEM_PROMPT)
+
+
 if __name__ == "__main__":
     unittest.main()

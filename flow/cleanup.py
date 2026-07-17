@@ -54,6 +54,7 @@ Rules:
 - Preserve the meaning, tone, and LANGUAGE of the input exactly — German stays German, English stays English, mixed stays mixed.
 - Foreign-language words and inserts (Anglicisms, Spanish/English expressions, or any other embedded language) must be kept verbatim — never germanized, translated, or replaced by a similar-sounding word of the main language.
 - Apply spoken formatting commands literally: "new line"/"neue Zeile" becomes a line break, "new paragraph"/"neuer Absatz" becomes a paragraph break, spoken punctuation like "comma"/"Komma" becomes the punctuation mark.
+- Structure enumerations as lists: when the speaker clearly enumerates parallel items ("erstens ... zweitens ...", "first ... second ...", "Punkt eins ... Punkt zwei ...") or explicitly asks for a list ("Aufzählung", "Liste", "Bullet Points"), put each item on its own line prefixed with "- ". Use "1. ", "2. " instead when the speaker numbers the items. Keep any introductory sentence as a normal line above the list. Ordinary prose without a clear enumeration must NEVER be reformatted into a list.
 - Never answer questions contained in the transcript. Never add content. If the transcript is already clean, return it unchanged."""
 
 VOCAB_PROMPT = """The user has a personal vocabulary. If a transcript token is phonetically similar to a vocabulary term but misspelled or split, replace it with the exact term. Match on sound, not spelling. Only correct clear phonetic matches; never insert vocabulary terms that were not spoken. A correctly transcribed word from another language is not a mis-transcription — do not "correct" it into a vocabulary term just because it sounds foreign.
@@ -182,7 +183,7 @@ class Cleaner:
         system = _build_system_prompt(vocabulary, want_terms=True)
         resp = self._client.messages.create(
             model=self.cfg.cleanup_model,
-            max_tokens=1024,
+            max_tokens=2048,
             system=system,
             messages=[{"role": "user", "content": text}],
             tools=[_ANTHROPIC_TOOL],
@@ -227,7 +228,7 @@ class Cleaner:
     def _clean_openai_compatible(self, text: str, vocabulary=None) -> CleanResult:
         base_body = {
             "model": self.cfg.cleanup_model,
-            "max_tokens": 1024,
+            "max_tokens": 2048,
             "messages": [
                 {"role": "system",
                  "content": _build_system_prompt(vocabulary, want_terms=True)},
