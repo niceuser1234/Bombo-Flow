@@ -24,7 +24,9 @@ sounds = true
 # pip install mlx-whisper) or "parakeet" (faster, but single-language-per-utterance).
 engine = "whisper"
 # parakeet_model = "mlx-community/parakeet-tdt-0.6b-v3"
-whisper_model = "mlx-community/whisper-large-v3-turbo"
+# Quantized (q4) is ~1.5-2x faster on Apple Silicon with near-identical
+# quality; use "mlx-community/whisper-large-v3-turbo" for full fp16.
+whisper_model = "mlx-community/whisper-large-v3-turbo-q4"
 
 [cleanup]
 # LLM cleanup of the raw transcript (removes filler words, fixes punctuation).

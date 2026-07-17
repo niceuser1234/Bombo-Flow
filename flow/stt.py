@@ -52,7 +52,16 @@ class WhisperEngine:
         import mlx_whisper
 
         result = mlx_whisper.transcribe(
-            audio, path_or_hf_repo=self.model_id, initial_prompt=initial_prompt
+            audio,
+            path_or_hf_repo=self.model_id,
+            initial_prompt=initial_prompt,
+            # Each dictation is one independent utterance: carrying decoded
+            # text across 30s windows costs time and propagates
+            # hallucinations into later windows.
+            condition_on_previous_text=False,
+            # Shortened fallback ladder — the slow retries at >=0.6 almost
+            # never improve short dictations.
+            temperature=(0.0, 0.2, 0.4),
         )
         return result["text"].strip()
 

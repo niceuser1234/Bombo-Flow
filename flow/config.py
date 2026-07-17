@@ -36,7 +36,7 @@ class Config:
     max_duration_s: float = 120.0
     engine: str = "whisper"
     parakeet_model: str = "mlx-community/parakeet-tdt-0.6b-v3"
-    whisper_model: str = "mlx-community/whisper-large-v3-turbo"
+    whisper_model: str = "mlx-community/whisper-large-v3-turbo-q4"
     cleanup_enabled: bool = True
     cleanup_provider: str = "openrouter"
     cleanup_base_url: str = "https://openrouter.ai/api/v1"
