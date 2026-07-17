@@ -1,6 +1,7 @@
 import threading
 import time
 import unittest
+from unittest import mock
 from unittest.mock import patch
 
 import numpy as np
@@ -94,6 +95,7 @@ def _build_pipeline():
     pipeline._max_timer = None
     pipeline._lock = threading.Lock()
     pipeline._stopping = False
+    pipeline._recover_timer = None
     return pipeline
 
 
@@ -425,6 +427,35 @@ class AudioRecoveryTests(unittest.TestCase):
             pipeline._finish_recording()
         reset.assert_called_once_with()
         self.assertIsNot(pipeline.recorder, old)
+
+    def test_timed_out_capture_does_not_reset_portaudio_or_swap(self):
+        """An empty capture means _stop_recorder_safe already timed out and
+        swapped the recorder. _finish_recording must NOT reset PortAudio (would
+        tear down the still-live abandoned stream) nor swap the recorder again."""
+        pipeline = _build_pipeline()
+        pipeline.recorder._recording = True
+        pipeline._press_time = time.monotonic() - 1.0  # > min_duration_s
+        # _stop_recorder_safe returns zeros(0): the timeout path.
+        pipeline._stop_recorder_safe = lambda: np.zeros(0, dtype=np.float32)
+        swapped = pipeline.recorder
+        with patch("flow.pipeline.audio_mod.reset_portaudio") as reset, \
+                patch("flow.pipeline.Recorder", _Recorder), \
+                patch("flow.pipeline.sound.play_stop"):
+            pipeline._finish_recording()
+        reset.assert_not_called()
+        self.assertIs(pipeline.recorder, swapped)
+
+    def test_new_recording_cancels_stale_recovery_timer(self):
+        """A recording started within the 2s error->idle window must cancel the
+        pending recovery timer so its set_state('idle') cannot clobber the
+        recording's menubar state."""
+        pipeline = _build_pipeline()
+        pipeline.engine = True
+        timer = mock.Mock()
+        pipeline._recover_timer = timer
+        pipeline.on_hold_start()
+        timer.cancel.assert_called_once_with()
+        self.assertIsNone(pipeline._recover_timer)
 
 
 if __name__ == "__main__":

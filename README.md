@@ -14,7 +14,7 @@ A personal Wispr Flow clone for macOS: **hold Right-Option, speak, release** —
 
 ## Upgrade notes
 
-The default STT engine is now **Whisper large-v3-turbo** (better than Parakeet for mixed-language dictation, e.g. switching between German and English mid-sentence). On first launch with this engine, the app downloads ~1.6 GB from Hugging Face, which takes a few minutes depending on your connection; every launch after that is instant.
+The default STT engine is now **Whisper large-v3-turbo** (better than Parakeet for mixed-language dictation, e.g. switching between German and English mid-sentence). On first launch with this engine, the app downloads ~0.5 GB from Hugging Face, which takes a few minutes depending on your connection; every launch after that is instant.
 
 **Existing installs are unaffected** — your `config.toml` already has an explicit engine set, so upgrading does not trigger a surprise download. To switch an existing install to Whisper, set `engine = "whisper"` under `[stt]` in `config.toml` (packaged app: `~/Library/Application Support/whisper-flow/config.toml`; source checkout: `config.toml` in the repo root).
 

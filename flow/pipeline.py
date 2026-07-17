@@ -103,6 +103,7 @@ class Pipeline:
         self._max_timer: threading.Timer | None = None
         self._lock = threading.Lock()
         self._stopping = False  # guard against concurrent finish+start
+        self._recover_timer: threading.Timer | None = None
 
     def start(self):
         # Build the native overlay before the first hotkey press so recording
@@ -119,7 +120,7 @@ class Pipeline:
         if self.cfg.engine == "whisper":
             log.info(
                 "Loading Whisper engine (%s) — first run downloads the model "
-                "(~1.6 GB) from Hugging Face, which can take a few minutes",
+                "(~0.5 GB) from Hugging Face, which can take a few minutes",
                 self.cfg.whisper_model,
             )
         try:
@@ -156,6 +157,12 @@ class Pipeline:
                 return
             if self.cfg.sounds:
                 sound.play_start()
+            # A fresh recording supersedes any pending recovery reset, so
+            # cancel the stale error->idle timer before it clobbers this
+            # recording's menubar state.
+            if self._recover_timer:
+                self._recover_timer.cancel()
+                self._recover_timer = None
             self.set_state("recording")
             self.overlay.show()
             self._max_timer = threading.Timer(
@@ -193,6 +200,19 @@ class Pipeline:
                 log.info("Discarding %.2fs tap", duration)
                 self.set_state("idle")
                 return
+            if len(captured) == 0:
+                # Empty capture means _stop_recorder_safe timed out and has
+                # ALREADY abandoned the wedged stream and swapped in a fresh
+                # Recorder. Do NOT reset PortAudio here: sd._terminate() while
+                # the abandoned CoreAudio stream is still live in the wedged
+                # HAL thread can crash. Just surface the error and recover UI.
+                log.warning(
+                    "recorder.stop() timed out — recorder already rebuilt; "
+                    "skipping PortAudio reset to avoid tearing down the "
+                    "abandoned stream"
+                )
+                self._enter_error_then_idle()
+                return
             if audio_mod.is_silent(captured):
                 log.warning(
                     "Recording is silent — resetting audio stack (stale "
@@ -213,10 +233,17 @@ class Pipeline:
         the next dictation works without restarting the app."""
         audio_mod.reset_portaudio()
         self.recorder = Recorder()
+        self._enter_error_then_idle()
+
+    def _enter_error_then_idle(self):
+        """Show the error state, then return to idle after 2s via a daemon
+        timer. The timer is tracked so a new recording started within that
+        window can cancel it (see on_hold_start) instead of having its state
+        clobbered."""
         self.set_state("error")
-        timer = threading.Timer(2.0, lambda: self.set_state("idle"))
-        timer.daemon = True
-        timer.start()
+        self._recover_timer = threading.Timer(2.0, lambda: self.set_state("idle"))
+        self._recover_timer.daemon = True
+        self._recover_timer.start()
 
     def _stop_recorder_safe(self) -> "np.ndarray":
         """Stop the recorder off the calling thread, with a hard timeout.
