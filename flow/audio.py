@@ -124,3 +124,20 @@ def is_silent(audio: np.ndarray) -> bool:
         return True
     rms = float(np.sqrt(np.mean(audio**2)))
     return rms < SILENCE_RMS
+
+
+def reset_portaudio():
+    """Rebuild PortAudio's device state.
+
+    PortAudio snapshots the CoreAudio device list once at initialization.
+    When the default input changes later (AirPods/headset connect or
+    disconnect, sleep/wake), new InputStreams can open against a stale
+    device and silently deliver zeros until the process restarts.
+    Terminate + re-initialize forces a fresh snapshot. Only call while no
+    stream is active."""
+    try:
+        sd._terminate()
+        sd._initialize()
+        log.info("PortAudio reset — device list refreshed")
+    except Exception:
+        log.exception("PortAudio reset failed")

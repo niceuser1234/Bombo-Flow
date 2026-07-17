@@ -1,5 +1,6 @@
 import threading
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -78,6 +79,19 @@ class RecorderAbandonTests(unittest.TestCase):
         self.assertTrue(done.wait(2.0), "stream was not closed in background")
         self.assertEqual(fake_stream.abort_calls, 1)
         self.assertEqual(fake_stream.close_calls, 1)
+
+
+class ResetPortaudioTests(unittest.TestCase):
+    def test_reset_terminates_then_reinitializes(self):
+        with patch.object(audio.sd, "_terminate") as term, \
+                patch.object(audio.sd, "_initialize") as init:
+            audio.reset_portaudio()
+        term.assert_called_once_with()
+        init.assert_called_once_with()
+
+    def test_reset_swallows_errors(self):
+        with patch.object(audio.sd, "_terminate", side_effect=RuntimeError("boom")):
+            audio.reset_portaudio()  # darf nie raisen
 
 
 if __name__ == "__main__":

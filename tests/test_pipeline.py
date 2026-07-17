@@ -400,5 +400,32 @@ class UsageBumpTests(unittest.TestCase):
         self.assertEqual(store.bumped, [])
 
 
+class AudioRecoveryTests(unittest.TestCase):
+    def test_failed_start_resets_portaudio_and_swaps_recorder(self):
+        pipeline = _build_pipeline()
+        pipeline.engine = True
+        broken = pipeline.recorder
+        broken.start = lambda: (_ for _ in ()).throw(RuntimeError("stale device"))
+        with patch("flow.pipeline.audio_mod.reset_portaudio") as reset, \
+                patch("flow.pipeline.Recorder", _Recorder):
+            pipeline.on_hold_start()
+        reset.assert_called_once_with()
+        self.assertIsNot(pipeline.recorder, broken)
+        self.assertFalse(pipeline.recorder.recording)
+
+    def test_silent_capture_resets_portaudio_and_swaps_recorder(self):
+        pipeline = _build_pipeline()
+        pipeline.recorder._recording = True
+        pipeline._press_time = time.monotonic() - 1.0  # > min_duration_s
+        old = pipeline.recorder
+        with patch("flow.pipeline.audio_mod.is_silent", return_value=True), \
+                patch("flow.pipeline.audio_mod.reset_portaudio") as reset, \
+                patch("flow.pipeline.Recorder", _Recorder), \
+                patch("flow.pipeline.sound.play_stop"):
+            pipeline._finish_recording()
+        reset.assert_called_once_with()
+        self.assertIsNot(pipeline.recorder, old)
+
+
 if __name__ == "__main__":
     unittest.main()

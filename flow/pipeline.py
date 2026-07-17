@@ -149,8 +149,10 @@ class Pipeline:
             try:
                 self.recorder.start()
             except Exception:
-                log.exception("Could not start recording (mic in use?)")
-                self.set_state("error")
+                log.exception(
+                    "Could not start recording — resetting audio stack"
+                )
+                self._recover_audio()
                 return
             if self.cfg.sounds:
                 sound.play_start()
@@ -193,17 +195,28 @@ class Pipeline:
                 return
             if audio_mod.is_silent(captured):
                 log.warning(
-                    "Recording is silent — check Microphone permission for the "
-                    "host app in System Settings > Privacy & Security > Microphone"
+                    "Recording is silent — resetting audio stack (stale "
+                    "input device?). If this repeats, check Microphone "
+                    "permission in System Settings > Privacy & Security"
                 )
-                self.set_state("error")
-                threading.Timer(2.0, lambda: self.set_state("idle")).start()
+                self._recover_audio()
                 return
             self.set_state("processing")
             self._queue.put((captured, time.monotonic()))
         finally:
             with self._lock:
                 self._stopping = False
+
+    def _recover_audio(self):
+        """A capture came back dead (silent stream or failed start): refresh
+        PortAudio's stale device snapshot and swap in a fresh Recorder so
+        the next dictation works without restarting the app."""
+        audio_mod.reset_portaudio()
+        self.recorder = Recorder()
+        self.set_state("error")
+        timer = threading.Timer(2.0, lambda: self.set_state("idle"))
+        timer.daemon = True
+        timer.start()
 
     def _stop_recorder_safe(self) -> "np.ndarray":
         """Stop the recorder off the calling thread, with a hard timeout.
