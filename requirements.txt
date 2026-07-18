@@ -2,6 +2,7 @@
 #   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 anthropic>=0.116
 certifi
+mlx-whisper
 numpy
 parakeet-mlx>=0.5
 pynput>=1.8

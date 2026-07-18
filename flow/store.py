@@ -21,7 +21,11 @@ from flow.config import APP_SUPPORT
 log = logging.getLogger(__name__)
 
 AUTO_DICT_CAP = 400
-PROMOTE_AT = 2
+# A candidate term is promoted to the dictionary the first time it is seen,
+# so the STT/cleanup bias from a learned term is active from the very next
+# dictation. Staging is still populated/cleared on the way through so the
+# bookkeeping stays uniform if this is ever raised again.
+PROMOTE_AT = 1
 
 
 def _utcnow() -> str:
@@ -142,9 +146,11 @@ class Store:
         return [{"word": r["word"], "auto": bool(r["auto"]), "added_ts": r["added_ts"]} for r in rows]
 
     def dictionary_words(self) -> list[str]:
+        """Words ordered by usage (most-used first), for prompt injection —
+        biasing STT and the cleanup LLM towards the terms that matter most."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT word FROM dictionary ORDER BY word COLLATE NOCASE"
+                "SELECT word FROM dictionary ORDER BY uses DESC, added_ts DESC"
             ).fetchall()
         return [r["word"] for r in rows]
 
@@ -153,6 +159,26 @@ class Store:
             self._conn.execute(
                 "INSERT OR IGNORE INTO dictionary (word, auto, added_ts, uses) VALUES (?, ?, ?, 0)",
                 (word, int(auto), _utcnow()),
+            )
+            self._conn.commit()
+
+    def bump_uses(self, words: list[str]) -> None:
+        """Increment the usage counter of words that appeared in a dictation.
+        Feeds the usage-ordering of dictionary_words() (prompt biasing) and
+        the least-used eviction in _make_room_for_auto_entry(). The IN
+        comparison inherits the column's COLLATE NOCASE, so matching is
+        case-insensitive like the primary key itself. Each term counts once
+        per dictation regardless of how many times it occurs in the text —
+        callers pass a de-duplicated list of terms present, not per-occurrence
+        counts."""
+        if not words:
+            return
+        placeholders = ", ".join("?" for _ in words)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE dictionary SET uses = uses + 1 "
+                f"WHERE word IN ({placeholders})",
+                words,
             )
             self._conn.commit()
 
@@ -321,10 +347,15 @@ class Store:
 
 
 _store: Store | None = None
+_store_lock = threading.Lock()
 
 
 def get_store() -> Store:
     global _store
+    # Fast path: reference read/assignment is GIL-atomic, so once _store is
+    # set this never touches the lock.
     if _store is None:
-        _store = Store()
+        with _store_lock:
+            if _store is None:
+                _store = Store()
     return _store

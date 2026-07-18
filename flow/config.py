@@ -34,9 +34,9 @@ class Config:
     hotkey: str = "fn"
     min_duration_s: float = 0.3
     max_duration_s: float = 120.0
-    engine: str = "parakeet"
+    engine: str = "whisper"
     parakeet_model: str = "mlx-community/parakeet-tdt-0.6b-v3"
-    whisper_model: str = "mlx-community/whisper-large-v3-turbo"
+    whisper_model: str = "mlx-community/whisper-large-v3-turbo-q4"
     cleanup_enabled: bool = True
     cleanup_provider: str = "openrouter"
     cleanup_base_url: str = "https://openrouter.ai/api/v1"
@@ -44,6 +44,7 @@ class Config:
     cleanup_min_words: int = 4
     cleanup_timeout_s: float = 5.0
     insert_mode: str = "paste"
+    sounds: bool = True
 
 
 def load() -> Config:
@@ -65,6 +66,7 @@ def load() -> Config:
     cfg.hotkey = hotkey.get("key", cfg.hotkey)
     cfg.min_duration_s = float(audio.get("min_duration_s", cfg.min_duration_s))
     cfg.max_duration_s = float(audio.get("max_duration_s", cfg.max_duration_s))
+    cfg.sounds = bool(audio.get("sounds", cfg.sounds))
     cfg.engine = stt.get("engine", cfg.engine)
     cfg.parakeet_model = stt.get("parakeet_model", cfg.parakeet_model)
     cfg.whisper_model = stt.get("whisper_model", cfg.whisper_model)

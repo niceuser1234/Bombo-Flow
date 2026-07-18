@@ -16,12 +16,17 @@ key = "fn"
 min_duration_s = 0.3
 # Recordings are force-stopped after this many seconds.
 max_duration_s = 120
+# Play a subtle start/stop blip when recording begins/ends.
+sounds = true
 
 [stt]
-# "parakeet" (recommended, fast + multilingual) or "whisper" (requires: pip install mlx-whisper)
-engine = "parakeet"
-parakeet_model = "mlx-community/parakeet-tdt-0.6b-v3"
-whisper_model = "mlx-community/whisper-large-v3-turbo"
+# "whisper" (recommended, better with mixed-language utterances, requires:
+# pip install mlx-whisper) or "parakeet" (faster, but single-language-per-utterance).
+engine = "whisper"
+# parakeet_model = "mlx-community/parakeet-tdt-0.6b-v3"
+# Quantized (q4) is ~1.5-2x faster on Apple Silicon with near-identical
+# quality; use "mlx-community/whisper-large-v3-turbo" for full fp16.
+whisper_model = "mlx-community/whisper-large-v3-turbo-q4"
 
 [cleanup]
 # LLM cleanup of the raw transcript (removes filler words, fixes punctuation).

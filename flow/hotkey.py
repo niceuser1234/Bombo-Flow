@@ -12,7 +12,7 @@ from pynput import keyboard
 
 log = logging.getLogger(__name__)
 
-DEBOUNCE_S = 0.05  # 50 ms gate for flags-changed (Fn) events.
+DEBOUNCE_S = 0.05  # 50 ms gate suppressing duplicate press transitions only.
 
 
 class SerialRunner:
@@ -24,6 +24,10 @@ class SerialRunner:
     CoreAudio's own IO thread (main holds the AudioUnit lock and waits for the
     HAL IO lock; the IO thread holds the HAL IO lock and waits for the
     AudioUnit lock). Handing the work to this thread keeps the main loop free.
+
+    The pynput-backed `HotkeyListener` shares this same protection: its
+    on_press/on_release callbacks are delivered on the pynput listener thread
+    and would otherwise wedge keyboard event delivery the same way.
     """
 
     def __init__(self, name="hotkey-dispatch"):
@@ -64,10 +68,23 @@ KEY_MAP = {
 }
 
 
-class HotkeyListener:
-    """Calls on_hold_start when the key goes down, on_hold_end when it comes up."""
+def _safe_call(callback, label):
+    try:
+        callback()
+    except Exception:
+        log.exception("%s failed", label)
 
-    def __init__(self, key_name, on_hold_start, on_hold_end):
+
+class HotkeyListener:
+    """Calls on_hold_start when the key goes down, on_hold_end when it comes up.
+
+    on_press/on_release are delivered on the pynput listener thread, so they
+    never call the pipeline directly — they only decide the press/release
+    transition and submit the callback to `runner`, which is a background
+    thread by default (see SerialRunner).
+    """
+
+    def __init__(self, key_name, on_hold_start, on_hold_end, runner=None):
         if key_name not in KEY_MAP:
             raise ValueError(f"Unknown hotkey {key_name!r}; options: {sorted(KEY_MAP)}")
         self._key = KEY_MAP[key_name]
@@ -75,33 +92,45 @@ class HotkeyListener:
         self._on_hold_end = on_hold_end
         self._held = False
         self._listener = None
+        self._own_runner = runner is None
+        self._runner = runner if runner is not None else SerialRunner()
 
     def start(self):
+        self.start_dispatcher()
         self._listener = keyboard.Listener(
             on_press=self._on_press, on_release=self._on_release
         )
         self._listener.start()
         log.info("Hotkey listener started (key=%s)", self._key)
 
+    def start_dispatcher(self):
+        if self._own_runner:
+            self._runner.start()
+
     def stop(self):
         if self._listener:
             self._listener.stop()
+            # pynput's stop() does not wait for the listener thread, so an
+            # _on_press/_on_release may still be mid-flight. Join it before
+            # stopping the runner: the None sentinel must not overtake an
+            # in-flight callback submission (pynput's Listener is a Thread).
+            try:
+                if self._listener.is_alive():
+                    self._listener.join(timeout=1.0)
+            except Exception:
+                log.exception("joining hotkey listener thread failed")
+        if self._own_runner:
+            self._runner.stop()
 
     def _on_press(self, key):
         if key == self._key and not self._held:
             self._held = True
-            try:
-                self._on_hold_start()
-            except Exception:
-                log.exception("on_hold_start failed")
+            self._runner(lambda: _safe_call(self._on_hold_start, "on_hold_start"))
 
     def _on_release(self, key):
         if key == self._key and self._held:
             self._held = False
-            try:
-                self._on_hold_end()
-            except Exception:
-                log.exception("on_hold_end failed")
+            self._runner(lambda: _safe_call(self._on_hold_end, "on_hold_end"))
 
 
 class FnHotkeyListener:
@@ -156,27 +185,19 @@ class FnHotkeyListener:
         from AppKit import NSEventModifierFlagFunction
 
         now = time.monotonic()
-        if now - self._last_event_time < DEBOUNCE_S:
+        fn_down = bool(event.modifierFlags() & NSEventModifierFlagFunction)
+        if fn_down and now - self._last_event_time < DEBOUNCE_S:
             return
         self._last_event_time = now
-
-        fn_down = bool(event.modifierFlags() & NSEventModifierFlagFunction)
         self._dispatch(fn_down)
 
     def _dispatch(self, fn_down):
         if fn_down and not self._held:
             self._held = True
-            self._runner(lambda: self._safe_call(self._on_hold_start, "on_hold_start"))
+            self._runner(lambda: _safe_call(self._on_hold_start, "on_hold_start"))
         elif not fn_down and self._held:
             self._held = False
-            self._runner(lambda: self._safe_call(self._on_hold_end, "on_hold_end"))
-
-    @staticmethod
-    def _safe_call(callback, label):
-        try:
-            callback()
-        except Exception:
-            log.exception("%s failed", label)
+            self._runner(lambda: _safe_call(self._on_hold_end, "on_hold_end"))
 
 
 def make_listener(key_name, on_hold_start, on_hold_end):

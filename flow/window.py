@@ -77,7 +77,13 @@ def _first_name() -> str:
 
 
 class _BridgeHandler(NSObject):
-    """ObjC-visible WKScriptMessageHandler dispatching bridge calls to Python."""
+    """ObjC-visible WKScriptMessageHandler dispatching bridge calls to Python.
+
+    WebKit always delivers script messages on the main thread, so the
+    NSPasteboard access in _on_message's "copyText" handler below is safe
+    without the main-thread marshalling flow/insert.py needs for its
+    worker-thread paste path.
+    """
 
     def initWithWindow_(self, window):
         self = objc.super(_BridgeHandler, self).init()

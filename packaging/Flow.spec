@@ -10,7 +10,7 @@ ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 datas, binaries, hiddenimports = [], [], []
 # Packages without ready-made PyInstaller hooks. mlx must bring its Metal
 # shader library (mlx/lib/mlx.metallib) or GPU inference dies at runtime.
-for pkg in ("mlx", "parakeet_mlx", "soxr"):
+for pkg in ("mlx", "parakeet_mlx", "soxr", "mlx_whisper"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
@@ -23,6 +23,11 @@ datas.append((os.path.join(ROOT, "config.toml"), "."))
 for f in glob.glob(os.path.join(ROOT, "flow", "ui", "*")):
     if os.path.isfile(f):
         datas.append((f, "flow/ui"))
+
+# Recording start/stop blips (loaded by flow/sound.py via _MEIPASS/flow/ui/assets).
+for f in glob.glob(os.path.join(ROOT, "flow", "ui", "assets", "*")):
+    if os.path.isfile(f):
+        datas.append((f, "flow/ui/assets"))
 
 a = Analysis(
     [os.path.join(ROOT, "packaging", "launcher.py")],

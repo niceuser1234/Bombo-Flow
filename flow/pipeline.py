@@ -11,6 +11,7 @@ import threading
 import time
 
 from . import audio as audio_mod
+from . import sound
 from . import stt
 from .audio import Recorder
 from .cleanup import Cleaner
@@ -47,13 +48,45 @@ def _words_changed(raw: str, cleaned: str) -> int:
     return changed
 
 
+def _terms_in(vocabulary: list[str], text: str) -> list[str]:
+    """Vocabulary terms that appear (case-insensitively) in text."""
+    text_l = text.lower()
+    return [t for t in vocabulary if t.lower() in text_l]
+
+
 def _dict_fixes(vocabulary: list[str], raw: str, cleaned: str) -> int:
     """Vocabulary terms that appear in the cleaned text but not in the raw
     transcript — i.e. corrections the dictionary is responsible for."""
     raw_l = raw.lower()
     return sum(
-        1 for t in vocabulary if t in cleaned and t.lower() not in raw_l
+        1 for t in _terms_in(vocabulary, cleaned) if t.lower() not in raw_l
     )
+
+
+INITIAL_PROMPT_TERM_LIMIT = 30
+INITIAL_PROMPT_MAX_CHARS = 800
+
+
+def _build_initial_prompt(vocabulary: list[str]) -> str | None:
+    """Bias STT towards learned dictionary terms (foreign words, proper
+    nouns) via Whisper's initial_prompt. Top terms only (vocabulary is
+    usage-ordered) and capped in length — initial_prompt is not meant for
+    long text and an oversized prompt can hurt more than it helps.
+
+    No language prefix (dictations mix German/English/other languages, and a
+    German "Vokabular:" label would itself bias the model). If the joined
+    terms exceed the cap, truncate at the last full term rather than
+    mid-term — a half-written term is more likely to confuse the model than
+    to help it."""
+    if not vocabulary:
+        return None
+    terms = vocabulary[:INITIAL_PROMPT_TERM_LIMIT]
+    prompt = ", ".join(terms)
+    if len(prompt) <= INITIAL_PROMPT_MAX_CHARS:
+        return prompt
+    truncated = prompt[:INITIAL_PROMPT_MAX_CHARS]
+    cut = truncated.rfind(", ")
+    return truncated[:cut] if cut != -1 else truncated
 
 
 class Pipeline:
@@ -70,6 +103,7 @@ class Pipeline:
         self._max_timer: threading.Timer | None = None
         self._lock = threading.Lock()
         self._stopping = False  # guard against concurrent finish+start
+        self._recover_timer: threading.Timer | None = None
 
     def start(self):
         # Build the native overlay before the first hotkey press so recording
@@ -83,6 +117,12 @@ class Pipeline:
 
     def _load_model(self) -> bool:
         self.set_state("loading")
+        if self.cfg.engine == "whisper":
+            log.info(
+                "Loading Whisper engine (%s) — first run downloads the model "
+                "(~0.5 GB) from Hugging Face, which can take a few minutes",
+                self.cfg.whisper_model,
+            )
         try:
             self.engine = stt.create_engine(self.cfg)
             self.engine.warmup()
@@ -110,9 +150,19 @@ class Pipeline:
             try:
                 self.recorder.start()
             except Exception:
-                log.exception("Could not start recording (mic in use?)")
-                self.set_state("error")
+                log.exception(
+                    "Could not start recording — resetting audio stack"
+                )
+                self._recover_audio()
                 return
+            if self.cfg.sounds:
+                sound.play_start()
+            # A fresh recording supersedes any pending recovery reset, so
+            # cancel the stale error->idle timer before it clobbers this
+            # recording's menubar state.
+            if self._recover_timer:
+                self._recover_timer.cancel()
+                self._recover_timer = None
             self.set_state("recording")
             self.overlay.show()
             self._max_timer = threading.Timer(
@@ -122,40 +172,78 @@ class Pipeline:
             self._max_timer.start()
 
     def on_hold_end(self):
-        with self._lock:
-            self._finish_recording()
+        self._finish_recording()
 
     def _force_stop(self):
         log.warning("Max recording duration reached — stopping")
-        with self._lock:
-            self._finish_recording()
+        self._finish_recording()
 
     def _finish_recording(self):
-        if not self.recorder.recording:
-            return
-        if self._max_timer:
-            self._max_timer.cancel()
-            self._max_timer = None
-        self._stopping = True
-        duration = time.monotonic() - self._press_time
-        captured = self._stop_recorder_safe()
-        self._stopping = False
+        with self._lock:
+            if not self.recorder.recording or self._stopping:
+                return
+            self._stopping = True
+            if self._max_timer:
+                self._max_timer.cancel()
+                self._max_timer = None
+            duration = time.monotonic() - self._press_time
+        # _stopping stays True until the tail below finishes, so a fast
+        # re-press cannot start a recording whose state/overlay this old
+        # press would then stomp. The blocking stop still runs lock-free.
+        try:
+            captured = self._stop_recorder_safe()
+            if self.cfg.sounds:
+                sound.play_stop()
 
-        self.overlay.hide()
-        if duration < self.cfg.min_duration_s:
-            log.info("Discarding %.2fs tap", duration)
-            self.set_state("idle")
-            return
-        if audio_mod.is_silent(captured):
-            log.warning(
-                "Recording is silent — check Microphone permission for the "
-                "host app in System Settings > Privacy & Security > Microphone"
-            )
-            self.set_state("error")
-            threading.Timer(2.0, lambda: self.set_state("idle")).start()
-            return
-        self.set_state("processing")
-        self._queue.put((captured, time.monotonic()))
+            self.overlay.hide()
+            if duration < self.cfg.min_duration_s:
+                log.info("Discarding %.2fs tap", duration)
+                self.set_state("idle")
+                return
+            if len(captured) == 0:
+                # Empty capture means _stop_recorder_safe timed out and has
+                # ALREADY abandoned the wedged stream and swapped in a fresh
+                # Recorder. Do NOT reset PortAudio here: sd._terminate() while
+                # the abandoned CoreAudio stream is still live in the wedged
+                # HAL thread can crash. Just surface the error and recover UI.
+                log.warning(
+                    "recorder.stop() timed out — recorder already rebuilt; "
+                    "skipping PortAudio reset to avoid tearing down the "
+                    "abandoned stream"
+                )
+                self._enter_error_then_idle()
+                return
+            if audio_mod.is_silent(captured):
+                log.warning(
+                    "Recording is silent — resetting audio stack (stale "
+                    "input device?). If this repeats, check Microphone "
+                    "permission in System Settings > Privacy & Security"
+                )
+                self._recover_audio()
+                return
+            self.set_state("processing")
+            self._queue.put((captured, time.monotonic()))
+        finally:
+            with self._lock:
+                self._stopping = False
+
+    def _recover_audio(self):
+        """A capture came back dead (silent stream or failed start): refresh
+        PortAudio's stale device snapshot and swap in a fresh Recorder so
+        the next dictation works without restarting the app."""
+        audio_mod.reset_portaudio()
+        self.recorder = Recorder()
+        self._enter_error_then_idle()
+
+    def _enter_error_then_idle(self):
+        """Show the error state, then return to idle after 2s via a daemon
+        timer. The timer is tracked so a new recording started within that
+        window can cancel it (see on_hold_start) instead of having its state
+        clobbered."""
+        self.set_state("error")
+        self._recover_timer = threading.Timer(2.0, lambda: self.set_state("idle"))
+        self._recover_timer.daemon = True
+        self._recover_timer.start()
 
     def _stop_recorder_safe(self) -> "np.ndarray":
         """Stop the recorder off the calling thread, with a hard timeout.
@@ -190,6 +278,7 @@ class Pipeline:
                 "stalled; abandoning the stream and rebuilding the recorder",
                 STOP_TIMEOUT_S,
             )
+            stuck.abandon()
             # The overlay's level_source closes over `self`, so it follows the
             # swap without further wiring.
             self.recorder = Recorder()
@@ -216,15 +305,17 @@ class Pipeline:
                     self.set_state("idle")
 
     def _process(self, captured, released_at):
-        raw = self.engine.transcribe(captured)
+        store = get_store()
+        vocabulary = store.dictionary_words()
+        raw = self.engine.transcribe(
+            captured, initial_prompt=_build_initial_prompt(vocabulary)
+        )
         t_stt = time.monotonic()
         log.info("STT (%.2fs): %r", t_stt - released_at, raw)
         if not raw:
             return
-        store = get_store()
-        text, new_terms, vocabulary = raw, [], []
+        text, new_terms = raw, []
         if self.cleanup_enabled:
-            vocabulary = store.dictionary_words()
             result = self.cleaner.clean(raw, vocabulary=vocabulary)
             text, new_terms = result.text, result.new_terms
             log.info("Cleaned (%.2fs): %r", time.monotonic() - t_stt, text)
@@ -240,6 +331,9 @@ class Pipeline:
                 corrected_words=_words_changed(raw, text),
                 dict_fixes=_dict_fixes(vocabulary, raw, text),
             )
+            used = _terms_in(vocabulary, text)
+            if used:
+                store.bump_uses(used)
             if new_terms:
                 accepted = filter_candidates(new_terms, vocabulary)
                 promoted = store.record_candidates(accepted)

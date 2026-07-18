@@ -81,8 +81,7 @@ class FnDispatchTests(unittest.TestCase):
                 return self._flags
 
         self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
-        # Skip past the debounce window so the release is accepted.
-        self.listener._last_event_time = 0.0
+        # Releases are never debounced, so this is delivered immediately.
         self.listener._handle_event(FakeEvent(0))
         self.assertEqual(self.rec.starts, 1)
         self.assertEqual(self.rec.ends, 1)
@@ -98,14 +97,46 @@ class FnDispatchTests(unittest.TestCase):
                 return self._flags
 
         self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
-        # Release within the debounce window — ignored.
+        # Release within the debounce window — releases are never debounced,
+        # so this is delivered.
         self.listener._handle_event(FakeEvent(0))
-        # Another press within debounce — also ignored.
+        # Another press within debounce of the release — still swallowed.
         self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
-        # Only the first press took effect; release and second press were
-        # swallowed by the debounce gate.
         self.assertEqual(self.rec.starts, 1)
-        self.assertEqual(self.rec.ends, 0)
+        self.assertEqual(self.rec.ends, 1)
+
+    def test_release_is_never_debounced(self):
+        from AppKit import NSEventModifierFlagFunction
+
+        class FakeEvent:
+            def __init__(self, flags):
+                self._flags = flags
+
+            def modifierFlags(self):
+                return self._flags
+
+        # Press immediately followed by release, well inside DEBOUNCE_S.
+        self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
+        self.listener._handle_event(FakeEvent(0))
+        self.assertEqual(self.rec.starts, 1)
+        self.assertEqual(self.rec.ends, 1)
+
+    def test_press_within_debounce_of_release_is_swallowed(self):
+        from AppKit import NSEventModifierFlagFunction
+
+        class FakeEvent:
+            def __init__(self, flags):
+                self._flags = flags
+
+            def modifierFlags(self):
+                return self._flags
+
+        self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
+        self.listener._handle_event(FakeEvent(0))
+        # A press right after the release, still within DEBOUNCE_S, is gated.
+        self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
+        self.assertEqual(self.rec.starts, 1)
+        self.assertEqual(self.rec.ends, 1)
 
     def test_debounce_allows_event_after_timeout(self):
         from AppKit import NSEventModifierFlagFunction
@@ -206,6 +237,129 @@ class FnRunsOffMainThreadTests(unittest.TestCase):
             self.assertTrue(done.wait(2.0), "dispatch thread died on exception")
         finally:
             listener.stop()
+
+
+class PynputRunsOffMainThreadTests(unittest.TestCase):
+    """pynput delivers on_press/on_release on its own listener thread.
+
+    A wedged callback there must not freeze delivery of further keyboard
+    events, so HotkeyListener routes callbacks through a SerialRunner just
+    like FnHotkeyListener does.
+    """
+
+    def test_callback_runs_on_another_thread(self):
+        ran_on = []
+        done = threading.Event()
+
+        def on_start():
+            ran_on.append(threading.current_thread().ident)
+            done.set()
+
+        listener = HotkeyListener("alt_r", on_start, lambda: None)
+        listener.start_dispatcher()
+        try:
+            listener._on_press(listener._key)
+            self.assertTrue(done.wait(2.0), "callback never ran")
+        finally:
+            listener.stop()
+
+        self.assertNotEqual(ran_on[0], threading.current_thread().ident)
+
+    def test_on_press_returns_while_callback_is_still_blocked(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def stuck_start():
+            entered.set()
+            release.wait(5.0)  # stands in for a wedged callback
+
+        listener = HotkeyListener("alt_r", stuck_start, lambda: None)
+        listener.start_dispatcher()
+        try:
+            listener._on_press(listener._key)  # must not block
+            self.assertTrue(entered.wait(2.0))
+            self.assertFalse(release.is_set())
+        finally:
+            release.set()
+            listener.stop()
+
+    def test_press_and_release_stay_ordered(self):
+        seen = []
+        done = threading.Event()
+
+        def on_end():
+            seen.append("end")
+            done.set()
+
+        listener = HotkeyListener("alt_r", lambda: seen.append("start"), on_end)
+        listener.start_dispatcher()
+        try:
+            listener._on_press(listener._key)
+            listener._on_release(listener._key)
+            self.assertTrue(done.wait(2.0))
+        finally:
+            listener.stop()
+
+        self.assertEqual(seen, ["start", "end"])
+
+    def test_callback_exception_does_not_kill_the_dispatch_thread(self):
+        done = threading.Event()
+
+        def boom():
+            raise RuntimeError("nope")
+
+        listener = HotkeyListener("alt_r", boom, done.set)
+        listener.start_dispatcher()
+        try:
+            listener._on_press(listener._key)    # raises inside the runner
+            listener._on_release(listener._key)  # must still be delivered
+            self.assertTrue(done.wait(2.0), "dispatch thread died on exception")
+        finally:
+            listener.stop()
+
+    def test_injected_runner_runs_synchronously(self):
+        rec = _Recorder()
+        listener = HotkeyListener("alt_r", rec.start, rec.end, runner=_direct)
+        listener._on_press(listener._key)
+        listener._on_release(listener._key)
+        self.assertEqual(rec.starts, 1)
+        self.assertEqual(rec.ends, 1)
+
+    def test_stop_joins_listener_before_stopping_runner(self):
+        # pynput's Listener.stop() does not wait for its thread, so a
+        # callback submission can still be mid-flight when stop() returns.
+        # stop() must join the listener thread before stopping the runner,
+        # or the SerialRunner None sentinel overtakes the in-flight
+        # submission and the final callback is silently dropped.
+        done = threading.Event()
+        listener = HotkeyListener("alt_r", done.set, lambda: None)
+        listener.start_dispatcher()
+
+        class FakeListenerThread:
+            def __init__(self, on_join):
+                self.calls = []
+                self._on_join = on_join
+
+            def stop(self):
+                self.calls.append("stop")
+
+            def is_alive(self):
+                return True
+
+            def join(self, timeout=None):
+                self.calls.append("join")
+                self._on_join()  # in-flight _on_press lands during the join
+
+        fake = FakeListenerThread(
+            on_join=lambda: listener._on_press(listener._key)
+        )
+        listener._listener = fake
+        listener.stop()
+
+        self.assertEqual(fake.calls, ["stop", "join"])
+        self.assertTrue(
+            done.wait(2.0), "in-flight callback was dropped by runner shutdown"
+        )
 
 
 if __name__ == "__main__":
