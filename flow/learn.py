@@ -12,6 +12,12 @@ dictionary words. A lowercase single common word never earns a dictionary slot.
 The one escape hatch is a strong *shape* signal (internal capitals/camelCase,
 digits, or a short all-caps acronym): those are almost always real product or
 technical names even when the lowercase form happens to be a dictionary word.
+
+Note what this filter cannot do: /usr/share/dict/words is English-only, and
+macOS ships no equivalent list for other languages. For a German dictation
+every ordinary noun looks like an unknown term here. `has_strong_shape` is
+therefore also what flow/store.py uses to decide how much corroboration a
+candidate needs before promotion — see PROMOTE_AT_PLAIN there.
 """
 
 import string
@@ -37,7 +43,7 @@ def _dict_words() -> set[str]:
     return _DICT_WORDS
 
 
-def _has_strong_shape(term: str) -> bool:
+def has_strong_shape(term: str) -> bool:
     """A shape that marks a term as a likely proper noun / technical name."""
     # Digits anywhere (n8n, s3, gpt4).
     if any(c.isdigit() for c in term):
@@ -75,7 +81,7 @@ def filter_candidates(terms: list[str], known_words: list[str]) -> list[str]:
         if key in seen:
             continue
         # Common dictionary word — reject unless it has a strong shape signal.
-        if key in dict_words and not _has_strong_shape(term):
+        if key in dict_words and not has_strong_shape(term):
             continue
         seen.add(key)
         accepted.append(term)

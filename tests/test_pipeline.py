@@ -6,7 +6,13 @@ from unittest.mock import patch
 
 import numpy as np
 
-from flow.pipeline import STOP_TIMEOUT_S, Pipeline, _build_initial_prompt
+from flow.pipeline import (
+    STOP_TIMEOUT_S,
+    Pipeline,
+    _build_initial_prompt,
+    _dict_fixes,
+    _terms_in,
+)
 
 
 class _Overlay:
@@ -24,6 +30,8 @@ class _Overlay:
 
 
 class _Recorder:
+    samplerate = 16000
+
     def __init__(self):
         self._recording = False
         self.stops = 0
@@ -72,6 +80,9 @@ class _FakeStore:
     def dictionary_words(self):
         return list(self._words)
 
+    def stt_bias_words(self):
+        return list(self._words)
+
     def add_dictation(self, *args, **kwargs):
         pass
 
@@ -96,7 +107,18 @@ def _build_pipeline():
     pipeline._lock = threading.Lock()
     pipeline._stopping = False
     pipeline._recover_timer = None
+    pipeline._recovery_lock = threading.Lock()
     return pipeline
+
+
+def _wait_for_recovery(pipeline, timeout=2.0):
+    """Audio recovery runs on its own thread so a blocking Pa_Terminate cannot
+    stall the hotkey dispatch thread. _schedule_recovery acquires the lock
+    synchronously, so waiting for it to clear is race-free."""
+    deadline = time.monotonic() + timeout
+    while pipeline._recovery_lock.locked() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert not pipeline._recovery_lock.locked(), "recovery did not finish"
 
 
 class PipelineStartupTests(unittest.TestCase):
@@ -134,20 +156,30 @@ class HoldStartGuardTests(unittest.TestCase):
 
 
 class SoundHookTests(unittest.TestCase):
-    def test_start_sound_plays_after_successful_recorder_start(self):
+    def test_start_sound_plays_before_the_stream_opens(self):
+        """The chime must be emitted before the microphone stream starts,
+        otherwise its attack transient is captured and transcribed at the head
+        of every recording."""
         pipeline = _build_pipeline()
         pipeline.engine = True
-        with patch("flow.pipeline.sound.play_start") as play_start:
+        order = []
+        pipeline.recorder.start = lambda: order.append("recorder.start")
+        with patch("flow.pipeline.sound.play_start",
+                   side_effect=lambda: order.append("play_start")):
             pipeline.on_hold_start()
-        play_start.assert_called_once_with()
+        self.assertEqual(order, ["play_start", "recorder.start"])
 
-    def test_start_sound_not_played_when_recorder_start_fails(self):
+    def test_start_sound_is_skipped_when_recovery_is_running(self):
         pipeline = _build_pipeline()
         pipeline.engine = True
-        pipeline.recorder.start = lambda: (_ for _ in ()).throw(RuntimeError("mic busy"))
-        with patch("flow.pipeline.sound.play_start") as play_start:
-            pipeline.on_hold_start()
-        play_start.assert_not_called()
+        pipeline._recovery_lock.acquire()
+        try:
+            with patch("flow.pipeline.sound.play_start") as play_start:
+                pipeline.on_hold_start()
+            play_start.assert_not_called()
+            self.assertFalse(pipeline.recorder.recording)
+        finally:
+            pipeline._recovery_lock.release()
 
     def test_start_sound_not_played_when_sounds_disabled(self):
         pipeline = _build_pipeline()
@@ -401,6 +433,39 @@ class UsageBumpTests(unittest.TestCase):
         store = self._run(["Kubernetes"], spoken="hallo welt wie geht es")
         self.assertEqual(store.bumped, [])
 
+    def test_short_terms_do_not_match_inside_longer_words(self):
+        """Substring matching made "AI" match "again" and "Go" match
+        "Google", inflating the counters that order the initial_prompt and
+        drive the least-used eviction."""
+        store = self._run(["AI", "Go"], spoken="again i googled it")
+        self.assertEqual(store.bumped, [])
+
+    def test_terms_still_match_next_to_punctuation(self):
+        store = self._run(["Kubernetes"], spoken="wir nutzen Kubernetes, oder?")
+        self.assertEqual(store.bumped, [["Kubernetes"]])
+
+
+class TermMatchingTests(unittest.TestCase):
+    def test_word_boundaries_are_respected(self):
+        self.assertEqual(_terms_in(["AI"], "again and again"), [])
+        self.assertEqual(_terms_in(["Go"], "I googled it"), [])
+        self.assertEqual(_terms_in(["AI"], "the AI model"), ["AI"])
+
+    def test_matching_stays_case_insensitive(self):
+        self.assertEqual(_terms_in(["Kubernetes"], "auf kubernetes"), ["Kubernetes"])
+
+    def test_terms_with_punctuation_anchor_correctly(self):
+        self.assertEqual(_terms_in([".NET"], "das .NET framework"), [".NET"])
+        self.assertEqual(_terms_in(["C++"], "in C++ geschrieben"), ["C++"])
+
+    def test_dict_fixes_counts_only_terms_the_cleanup_added(self):
+        # "Kubernetes" was already in the raw transcript — not a fix.
+        self.assertEqual(_dict_fixes(["Kubernetes"], "kubernetes läuft",
+                                     "Kubernetes läuft"), 0)
+        # "n8n" only appears after cleanup — that is a dictionary fix.
+        self.assertEqual(_dict_fixes(["n8n"], "acht en acht läuft",
+                                     "n8n läuft"), 1)
+
 
 class AudioRecoveryTests(unittest.TestCase):
     def test_failed_start_resets_portaudio_and_swaps_recorder(self):
@@ -409,11 +474,85 @@ class AudioRecoveryTests(unittest.TestCase):
         broken = pipeline.recorder
         broken.start = lambda: (_ for _ in ()).throw(RuntimeError("stale device"))
         with patch("flow.pipeline.audio_mod.reset_portaudio") as reset, \
-                patch("flow.pipeline.Recorder", _Recorder):
+                patch("flow.pipeline.Recorder", _Recorder), \
+                patch("flow.pipeline.sound.play_start"):
             pipeline.on_hold_start()
+            _wait_for_recovery(pipeline)
         reset.assert_called_once_with()
         self.assertIsNot(pipeline.recorder, broken)
         self.assertFalse(pipeline.recorder.recording)
+
+    def test_recovery_runs_off_the_hotkey_dispatch_thread(self):
+        """reset_portaudio() blocks in Pa_Terminate exactly when CoreAudio is
+        wedged. Running it inline under self._lock would stall the only thread
+        servicing hotkey callbacks, wedging the hotkey permanently."""
+        pipeline = _build_pipeline()
+        pipeline.engine = True
+        pipeline.recorder.start = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        caller = threading.current_thread().ident
+        ran_on = []
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_reset():
+            ran_on.append(threading.current_thread().ident)
+            entered.set()
+            release.wait(2.0)  # stands in for a wedged Pa_Terminate
+
+        with patch("flow.pipeline.audio_mod.reset_portaudio",
+                   side_effect=blocking_reset), \
+                patch("flow.pipeline.Recorder", _Recorder), \
+                patch("flow.pipeline.sound.play_start"):
+            pipeline.on_hold_start()  # must not block on the teardown
+            self.assertTrue(entered.wait(2.0), "recovery never ran")
+            self.assertFalse(release.is_set())
+            release.set()
+            _wait_for_recovery(pipeline)
+
+        self.assertEqual(len(ran_on), 1)
+        self.assertNotEqual(ran_on[0], caller)
+
+    def test_live_stream_is_abandoned_instead_of_terminating_portaudio(self):
+        """If the recorder still holds an open stream, Pa_Terminate can crash.
+        Drop the stream and leave the device snapshot alone."""
+        pipeline = _build_pipeline()
+        pipeline.engine = True
+        stuck = pipeline.recorder
+        stuck._recording = True
+        stuck.start = lambda: (_ for _ in ()).throw(RuntimeError("half open"))
+
+        with patch("flow.pipeline.audio_mod.reset_portaudio") as reset, \
+                patch("flow.pipeline.Recorder", _Recorder), \
+                patch("flow.pipeline.sound.play_start"):
+            pipeline._schedule_recovery()
+            _wait_for_recovery(pipeline)
+
+        reset.assert_not_called()
+        self.assertEqual(stuck.abandoned, 1)
+        self.assertIsNot(pipeline.recorder, stuck)
+
+    def test_concurrent_recovery_requests_collapse_into_one(self):
+        pipeline = _build_pipeline()
+        calls = []
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_reset():
+            calls.append(1)
+            entered.set()
+            release.wait(2.0)
+
+        with patch("flow.pipeline.audio_mod.reset_portaudio",
+                   side_effect=blocking_reset), \
+                patch("flow.pipeline.Recorder", _Recorder):
+            pipeline._schedule_recovery()
+            self.assertTrue(entered.wait(2.0))
+            # Second request arrives while the first is still tearing down.
+            pipeline._schedule_recovery()
+            release.set()
+            _wait_for_recovery(pipeline)
+
+        self.assertEqual(len(calls), 1)
 
     def test_silent_capture_resets_portaudio_and_swaps_recorder(self):
         pipeline = _build_pipeline()
@@ -425,6 +564,7 @@ class AudioRecoveryTests(unittest.TestCase):
                 patch("flow.pipeline.Recorder", _Recorder), \
                 patch("flow.pipeline.sound.play_stop"):
             pipeline._finish_recording()
+            _wait_for_recovery(pipeline)
         reset.assert_called_once_with()
         self.assertIsNot(pipeline.recorder, old)
 
@@ -445,6 +585,19 @@ class AudioRecoveryTests(unittest.TestCase):
         reset.assert_not_called()
         self.assertIs(pipeline.recorder, swapped)
 
+    def test_second_failure_cancels_the_previous_recovery_timer(self):
+        """Two failures inside the 2s error window left the first timer
+        orphaned; it fired later and forced 'idle' over whatever was running."""
+        pipeline = _build_pipeline()
+        first = mock.Mock()
+        pipeline._recover_timer = first
+        pipeline._enter_error_then_idle()
+        try:
+            first.cancel.assert_called_once_with()
+            self.assertIsNot(pipeline._recover_timer, first)
+        finally:
+            pipeline._recover_timer.cancel()
+
     def test_new_recording_cancels_stale_recovery_timer(self):
         """A recording started within the 2s error->idle window must cancel the
         pending recovery timer so its set_state('idle') cannot clobber the
@@ -456,6 +609,42 @@ class AudioRecoveryTests(unittest.TestCase):
         pipeline.on_hold_start()
         timer.cancel.assert_called_once_with()
         self.assertIsNone(pipeline._recover_timer)
+
+
+class PersistenceOrderTests(unittest.TestCase):
+    def test_transcript_is_stored_even_when_inserting_fails(self):
+        """Insertion is the step most likely to fail for reasons outside our
+        control. A transcript that only lives in the history is recoverable;
+        one that was never written down is gone for good."""
+        pipeline = _build_pipeline()
+        pipeline.engine = _RecordingEngine(text="hallo welt")
+        store = _FakeStore()
+        stored = []
+        store.add_dictation = lambda raw, text, **kw: stored.append((raw, text, kw))
+
+        with patch("flow.pipeline.get_store", return_value=store), \
+                patch("flow.pipeline.insert_text",
+                      side_effect=RuntimeError("no pasteboard")), \
+                patch("flow.pipeline._frontmost_app", return_value="TestApp"):
+            with self.assertRaises(RuntimeError):
+                pipeline._process(np.zeros(100, dtype=np.float32), time.monotonic())
+
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0][1], "hallo welt")
+
+    def test_duration_uses_the_recorder_sample_rate(self):
+        pipeline = _build_pipeline()
+        pipeline.engine = _RecordingEngine(text="hallo welt")
+        store = _FakeStore()
+        stored = []
+        store.add_dictation = lambda raw, text, **kw: stored.append(kw)
+
+        with patch("flow.pipeline.get_store", return_value=store), \
+                patch("flow.pipeline.insert_text"), \
+                patch("flow.pipeline._frontmost_app", return_value="TestApp"):
+            pipeline._process(np.zeros(8000, dtype=np.float32), time.monotonic())
+
+        self.assertAlmostEqual(stored[0]["duration_s"], 0.5)
 
 
 if __name__ == "__main__":

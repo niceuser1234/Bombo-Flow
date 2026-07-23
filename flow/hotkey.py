@@ -12,7 +12,10 @@ from pynput import keyboard
 
 log = logging.getLogger(__name__)
 
-DEBOUNCE_S = 0.05  # 50 ms gate suppressing duplicate press transitions only.
+# 50 ms gate against duplicate flagsChanged events. It only ever suppresses
+# events that would not change the held state — a real press/release
+# transition is always dispatched, however fast it follows the previous one.
+DEBOUNCE_S = 0.05
 
 
 class SerialRunner:
@@ -47,7 +50,14 @@ class SerialRunner:
         self._queue.put(func)
 
     def stop(self):
+        # Join before dropping the reference: clearing _thread first would let
+        # a following start() add a second consumer to the same queue while
+        # the old one is still draining it.
+        thread = self._thread
+        if thread is None:
+            return
         self._queue.put(None)
+        thread.join(timeout=1.0)
         self._thread = None
 
     def _loop(self):
@@ -145,6 +155,13 @@ class FnHotkeyListener:
     picker / input-source switch). Users disable that in System Settings →
     Keyboard → "Press 🌐 key to → Do Nothing".
 
+    Two monitors are needed, not one. A *global* monitor by definition only
+    sees events aimed at other applications, and this app activates its
+    dashboard window on launch — with the global monitor alone the hotkey is
+    dead until the user clicks into another app. The *local* monitor covers
+    exactly the gap: events delivered while we are frontmost. It must return
+    the event so Fn keeps working normally inside our own UI.
+
     The handler runs on the main thread, so it never calls the pipeline
     directly — it only decides the press/release transition and submits the
     callback to `runner`, which is a background thread by default.
@@ -155,6 +172,7 @@ class FnHotkeyListener:
         self._on_hold_end = on_hold_end
         self._held = False
         self._monitor = None
+        self._local_monitor = None
         self._last_event_time = 0.0
         self._own_runner = runner is None
         self._runner = runner if runner is not None else SerialRunner()
@@ -166,27 +184,43 @@ class FnHotkeyListener:
         self._monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
             NSEventMaskFlagsChanged, self._handle_event
         )
-        log.info("Fn hotkey listener started")
+        self._local_monitor = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+            NSEventMaskFlagsChanged, self._handle_local_event
+        )
+        log.info("Fn hotkey listener started (global + local monitor)")
 
     def start_dispatcher(self):
         if self._own_runner:
             self._runner.start()
 
     def stop(self):
-        if self._monitor is not None:
+        if self._monitor is not None or self._local_monitor is not None:
             from AppKit import NSEvent
 
-            NSEvent.removeMonitor_(self._monitor)
+            for monitor in (self._monitor, self._local_monitor):
+                if monitor is not None:
+                    NSEvent.removeMonitor_(monitor)
             self._monitor = None
+            self._local_monitor = None
         if self._own_runner:
             self._runner.stop()
+
+    def _handle_local_event(self, event):
+        """Local-monitor variant: same decision, but the event must be passed
+        through or Fn stops working inside our own window."""
+        self._handle_event(event)
+        return event
 
     def _handle_event(self, event):
         from AppKit import NSEventModifierFlagFunction
 
         now = time.monotonic()
         fn_down = bool(event.modifierFlags() & NSEventModifierFlagFunction)
-        if fn_down and now - self._last_event_time < DEBOUNCE_S:
+        # Only gate events that would not change the held state. Gating on
+        # `fn_down` alone swallowed a genuine press arriving within 50 ms of a
+        # release, and since flagsChanged is edge-triggered no further event
+        # comes while Fn stays down — the whole dictation was lost silently.
+        if fn_down == self._held and now - self._last_event_time < DEBOUNCE_S:
             return
         self._last_event_time = now
         self._dispatch(fn_down)

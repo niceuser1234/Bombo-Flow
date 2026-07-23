@@ -20,9 +20,28 @@ from .menubar import FlowApp
 from .pipeline import Pipeline
 
 
+class PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler that keeps the log file owner-only.
+
+    The log carries dictation metadata and, at DEBUG, whole transcripts —
+    which for a dictation app means passwords, health details, anything the
+    user ever spoke. The default 0644 makes that readable by every other
+    account on the Mac. _open() also runs after each rotation, so the new
+    file gets the same treatment.
+    """
+
+    def _open(self):
+        stream = super()._open()
+        try:
+            os.chmod(self.baseFilename, 0o600)
+        except OSError:
+            pass
+        return stream
+
+
 def setup_logging():
     config_mod.LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    handler = logging.handlers.RotatingFileHandler(
+    handler = PrivateRotatingFileHandler(
         config_mod.LOG_PATH, maxBytes=1_000_000, backupCount=2
     )
     logging.basicConfig(

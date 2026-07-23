@@ -17,15 +17,38 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 from flow.config import APP_SUPPORT
+from flow.learn import has_strong_shape
 
 log = logging.getLogger(__name__)
 
 AUTO_DICT_CAP = 400
-# A candidate term is promoted to the dictionary the first time it is seen,
-# so the STT/cleanup bias from a learned term is active from the very next
-# dictation. Staging is still populated/cleared on the way through so the
-# bookkeeping stays uniform if this is ever raised again.
+# A term with a distinctive shape (n8n, LangGraph, API) is promoted the first
+# time it is seen: it is unmistakably a product or technical name, so waiting
+# only delays a correction the user wants.
 PROMOTE_AT = 1
+# An ordinary-looking word needs to be heard twice. Whisper mis-hearing a word
+# once is enough to produce a plausible pseudo-word that the cleanup LLM
+# reports as a new term and that filter_candidates cannot reject — "not a
+# common dictionary word" is precisely its criterion, and the only word list
+# macOS ships is English, so every German noun looks novel to it. Requiring a
+# second sighting is what keeps a single mis-transcription out of the
+# dictionary; see flow/learn.py.
+PROMOTE_AT_PLAIN = 2
+
+
+def _restrict_permissions(db_path) -> None:
+    """Make the store owner-only. It holds every transcript ever dictated, and
+    SQLite creates the database (and its -wal/-shm siblings) 0644 by default,
+    i.e. readable by any other account on the Mac."""
+    for path in (
+        db_path,
+        db_path.with_name(db_path.name + "-wal"),
+        db_path.with_name(db_path.name + "-shm"),
+    ):
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass  # not created yet, or not ours — best effort
 
 
 def _utcnow() -> str:
@@ -47,6 +70,7 @@ class Store:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        _restrict_permissions(self.db_path)
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._init_schema()
@@ -154,6 +178,28 @@ class Store:
             ).fetchall()
         return [r["word"] for r in rows]
 
+    def stt_bias_words(self) -> list[str]:
+        """Words safe to inject into Whisper's initial_prompt.
+
+        Auto-learned terms are held back until they have been seen again in a
+        later dictation (uses > 0). Biasing the decoder towards a term the
+        model produced only once is self-reinforcing: if that sighting was a
+        mis-transcription, the prompt makes the same mistake more likely next
+        time, and bump_uses then counts the repeat as confirmation. Routing
+        new terms through the cleanup LLM first — which sees the surrounding
+        text and is told not to insert terms that were not spoken — breaks
+        that loop.
+
+        Manually added words are the user's explicit choice and bias from the
+        moment they are added.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT word FROM dictionary WHERE auto = 0 OR uses > 0 "
+                "ORDER BY uses DESC, added_ts DESC"
+            ).fetchall()
+        return [r["word"] for r in rows]
+
     def add_word(self, word: str, auto: bool = False) -> None:
         with self._lock:
             self._conn.execute(
@@ -190,7 +236,8 @@ class Store:
 
     def record_candidates(self, terms: list[str]) -> list[str]:
         """Track repeated unrecognized terms; auto-promote to the dictionary
-        once a term has been seen PROMOTE_AT times."""
+        once a term has been seen often enough — immediately for a term with a
+        distinctive shape, on the second sighting otherwise."""
         promoted = []
         with self._lock:
             for term in terms:
@@ -213,7 +260,10 @@ class Store:
                     self._conn.execute(
                         "UPDATE staging SET count = ? WHERE term = ?", (count, term)
                     )
-                if count >= PROMOTE_AT:
+                threshold = (
+                    PROMOTE_AT if has_strong_shape(term) else PROMOTE_AT_PLAIN
+                )
+                if count >= threshold:
                     self._make_room_for_auto_entry()
                     self._conn.execute(
                         "INSERT OR IGNORE INTO dictionary (word, auto, added_ts, uses) "

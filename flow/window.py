@@ -41,7 +41,7 @@ from Foundation import (
 from PyObjCTools import AppHelper
 from WebKit import WKWebView, WKWebViewConfiguration
 
-from .config import PROJECT_ROOT
+from .config import IS_FROZEN, PROJECT_ROOT
 
 log = logging.getLogger(__name__)
 
@@ -139,7 +139,10 @@ class MainWindow:
             self._handler, "bridge"
         )
         # Dev nicety: enable the Web Inspector (right-click → Inspect Element).
-        config.preferences().setValue_forKey_(True, "developerExtrasEnabled")
+        # Not in a shipped bundle — it hands anyone at the keyboard a console
+        # on the bridge, and with it the store's delete/copy actions.
+        if not IS_FROZEN:
+            config.preferences().setValue_forKey_(True, "developerExtrasEnabled")
 
         webview = WKWebView.alloc().initWithFrame_configuration_(frame, config)
         webview.setAutoresizingMask_(1 << 1 | 1 << 4)  # width | height sizable

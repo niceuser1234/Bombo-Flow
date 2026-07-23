@@ -62,13 +62,25 @@ class Recorder:
         self._chunks = []
         self.level = 0.0
         self._discard = False
-        self._stream = sd.InputStream(
+        stream = sd.InputStream(
             samplerate=self.samplerate,
             channels=1,
             dtype="float32",
             callback=self._callback,
         )
-        self._stream.start()
+        try:
+            stream.start()
+        except Exception:
+            # Publish the stream only once it is actually running. A
+            # half-open stream left in self._stream would make the caller's
+            # recovery path call reset_portaudio() — i.e. Pa_Terminate — with
+            # a live CoreAudio stream, which is exactly what crashes.
+            try:
+                stream.close(ignore_errors=True)
+            except Exception:
+                log.exception("Closing a stream that failed to start went wrong")
+            raise
+        self._stream = stream
 
     def _callback(self, indata, frames, time_info, status):
         if self._discard:

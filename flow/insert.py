@@ -79,6 +79,13 @@ def _on_main(func, timeout=None):
     main thread, run inline; otherwise marshal the call over via
     PyObjCTools.AppHelper.callAfter and block (with a timeout) on a
     threading.Event for the result.
+
+    Two things the naive version gets wrong, both of which corrupt the user's
+    clipboard: a timed-out block stays queued and runs whenever the main
+    thread frees up (hence the cancel flag, checked on the main thread just
+    before the work), and an exception inside func() would leave `result`
+    empty so the caller saw an unrelated IndexError instead of the real
+    failure (hence the explicit re-raise).
     """
     if NSThread.isMainThread():
         return func()
@@ -87,34 +94,93 @@ def _on_main(func, timeout=None):
         timeout = _ON_MAIN_TIMEOUT_S
 
     result = []
+    failure = []
+    cancelled = threading.Event()
     done = threading.Event()
 
     def run():
+        if cancelled.is_set():
+            return
         try:
             result.append(func())
+        except Exception as exc:  # noqa: BLE001 — re-raised on the caller's thread
+            log.exception(
+                "Main-thread call %s failed", getattr(func, "__name__", func)
+            )
+            failure.append(exc)
         finally:
             done.set()
 
     AppHelper.callAfter(run)
     if not done.wait(timeout):
+        cancelled.set()
         raise TimeoutError(f"main thread did not respond within {timeout:.1f}s")
+    if failure:
+        raise failure[0]
     return result[0]
 
 
+def _snapshot_pasteboard(pb) -> list[dict]:
+    """Every item on the pasteboard, as {type: data} dicts.
+
+    Not just the string type: a pasteboard holding an image, a file or PDF
+    data returns None for NSPasteboardTypeString, and clearContents() below
+    destroys that content. Snapshotting all representations is what makes the
+    paste round-trip non-destructive.
+    """
+    items = []
+    for item in pb.pasteboardItems() or []:
+        entry = {}
+        for type_name in item.types() or []:
+            data = item.dataForType_(type_name)
+            if data is not None:
+                entry[str(type_name)] = data
+        if entry:
+            items.append(entry)
+    return items
+
+
+def _restore_pasteboard(pb, items: list[dict]) -> None:
+    """Put a _snapshot_pasteboard() result back. An empty snapshot clears the
+    pasteboard rather than leaving our dictation text behind."""
+    from AppKit import NSPasteboardItem
+
+    pb.clearContents()
+    if not items:
+        return
+    restored = []
+    for entry in items:
+        item = NSPasteboardItem.alloc().init()
+        for type_name, data in entry.items():
+            item.setData_forType_(data, type_name)
+        restored.append(item)
+    pb.writeObjects_(restored)
+
+
 def _paste_text(text: str):
+    # Filled by save_and_set once it actually runs on the main thread, so the
+    # timeout path below can tell "never ran" from "ran too late".
+    saved: dict = {}
+
     def save_and_set():
         pb = NSPasteboard.generalPasteboard()
-        old = pb.stringForType_(NSPasteboardTypeString)
+        saved["items"] = _snapshot_pasteboard(pb)
         pb.clearContents()
         pb.setString_forType_(text, NSPasteboardTypeString)
-        return old, pb.changeCount()
+        return pb.changeCount()
 
     try:
-        old, our_change = _on_main(save_and_set)
+        our_change = _on_main(save_and_set)
     except TimeoutError:
-        # A wedged main thread means we can't safely save/restore the
-        # clipboard — pasting a stale one is worse than not pasting.
+        # save_and_set may still be queued and fire later. callAfter is FIFO,
+        # so an undo queued now lands *behind* it: if it runs, this repairs
+        # the clipboard; if the cancel won, `saved` is empty and this is a
+        # no-op. Pasting a stale clipboard is worse than not pasting.
         log.warning("Main thread unresponsive — skipping paste")
+        _schedule_clipboard_repair(saved)
+        return
+    except Exception:
+        log.exception("Could not stage the clipboard — skipping paste")
         return
 
     time.sleep(0.05)  # let the pasteboard settle before the app reads it
@@ -125,14 +191,29 @@ def _paste_text(text: str):
 
     def restore():
         pb = NSPasteboard.generalPasteboard()
-        if old is not None and pb.changeCount() == our_change:
-            pb.clearContents()
-            pb.setString_forType_(old, NSPasteboardTypeString)
+        if pb.changeCount() == our_change:
+            _restore_pasteboard(pb, saved.get("items") or [])
 
     try:
         _on_main(restore)
     except TimeoutError:
         log.warning("Main thread unresponsive — could not restore previous clipboard")
+    except Exception:
+        log.exception("Restoring the previous clipboard failed")
+
+
+def _schedule_clipboard_repair(saved: dict) -> None:
+    """Undo a paste-staging that timed out but may still land on the main
+    thread. Runs after the staging block thanks to callAfter's FIFO order."""
+
+    def repair():
+        items = saved.get("items")
+        if items is None:
+            return  # staging was cancelled in time — nothing to undo
+        _restore_pasteboard(NSPasteboard.generalPasteboard(), items)
+        log.info("Clipboard restored after a timed-out paste")
+
+    AppHelper.callAfter(repair)
 
 
 def _post_cmd_v():
@@ -144,12 +225,34 @@ def _post_cmd_v():
         time.sleep(0.01)
 
 
+def _utf16_len(text: str) -> int:
+    """Length in UTF-16 code units — what CGEventKeyboardSetUnicodeString
+    counts. Python's len() counts code points, so emoji and other non-BMP
+    characters would be under-reported and the tail of the chunk dropped."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _utf16_chunks(text: str, limit: int):
+    """Split into chunks of at most `limit` UTF-16 units, never mid-character
+    (a surrogate pair split across two events types as garbage)."""
+    chunk: list[str] = []
+    size = 0
+    for ch in text:
+        width = 2 if ord(ch) > 0xFFFF else 1
+        if chunk and size + width > limit:
+            yield "".join(chunk)
+            chunk, size = [], 0
+        chunk.append(ch)
+        size += width
+    if chunk:
+        yield "".join(chunk)
+
+
 def _type_text(text: str, chunk_size: int = 20):
     src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
-    for i in range(0, len(text), chunk_size):
-        chunk = text[i : i + chunk_size]
+    for chunk in _utf16_chunks(text, chunk_size):
         for down in (True, False):
             ev = Quartz.CGEventCreateKeyboardEvent(src, 0, down)
-            Quartz.CGEventKeyboardSetUnicodeString(ev, len(chunk), chunk)
+            Quartz.CGEventKeyboardSetUnicodeString(ev, _utf16_len(chunk), chunk)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
         time.sleep(0.01)

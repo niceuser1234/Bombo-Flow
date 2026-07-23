@@ -54,17 +54,19 @@ def test_get_store_is_thread_safe_singleton():
         store_mod._store = None
 
 
-def test_candidate_promoted_to_dictionary_after_single_sighting():
-    """PROMOTE_AT = 1: a candidate term must land in the dictionary — and
-    therefore start biasing STT/cleanup — after the very first sighting,
-    not the second."""
+def test_shaped_candidate_promoted_after_single_sighting():
+    """A term whose shape marks it as a product or technical name (digits,
+    camelCase, short acronym) lands in the dictionary — and starts helping the
+    cleanup LLM — on the first sighting. Waiting would only delay a correction
+    the user wants. Ordinary-looking words take the slower path; see
+    test_plain_words_need_a_second_sighting."""
     with tempfile.TemporaryDirectory() as tmp:
         store = Store(db_path=Path(tmp) / "store.db")
 
-        promoted = store.record_candidates(["Kubernetes"])
+        promoted = store.record_candidates(["PyTorch"])
 
-        assert promoted == ["Kubernetes"]
-        assert "Kubernetes" in store.dictionary_words()
+        assert promoted == ["PyTorch"]
+        assert "PyTorch" in store.dictionary_words()
 
 
 def test_dictionary_words_ordered_by_usage():
@@ -79,6 +81,61 @@ def test_dictionary_words_ordered_by_usage():
         store.bump_uses(["Common"])
 
         assert store.dictionary_words() == ["Common", "Rare"]
+
+
+def test_shaped_terms_promote_on_first_sighting():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Store(db_path=Path(tmp) / "store.db")
+        # digits, camelCase and a short all-caps acronym
+        promoted = store.record_candidates(["n8n", "LangGraph", "API"])
+        assert sorted(promoted) == ["API", "LangGraph", "n8n"]
+
+
+def test_plain_words_need_a_second_sighting():
+    """Whisper mis-hearing a word once produces a plausible pseudo-word that
+    filter_candidates cannot reject — "not a common dictionary word" is its
+    criterion, and macOS ships an English word list only. Corroboration is
+    what keeps a single mis-transcription out of the dictionary."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Store(db_path=Path(tmp) / "store.db")
+
+        assert store.record_candidates(["Besprechung"]) == []
+        assert [w["word"] for w in store.dictionary()] == []
+
+        assert store.record_candidates(["Besprechung"]) == ["Besprechung"]
+        assert [w["word"] for w in store.dictionary()] == ["Besprechung"]
+
+
+def test_stt_bias_holds_back_unconfirmed_auto_terms():
+    """An auto-learned term must not bias the decoder until it has been seen
+    again — otherwise a single mis-transcription makes itself more likely."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Store(db_path=Path(tmp) / "store.db")
+        store.add_word("Handverlesen", auto=False)  # user's explicit choice
+        store.record_candidates(["n8n"])            # auto, uses = 0
+
+        assert store.dictionary_words() == ["Handverlesen", "n8n"] or set(
+            store.dictionary_words()
+        ) == {"Handverlesen", "n8n"}
+        assert store.stt_bias_words() == ["Handverlesen"]
+
+        # Seen again in a later dictation — now it may bias STT.
+        store.bump_uses(["n8n"])
+        assert store.stt_bias_words() == ["n8n", "Handverlesen"]
+
+
+def test_database_is_not_world_readable():
+    """The store holds every transcript ever dictated. SQLite creates it 0644
+    by default, i.e. readable by any other account on this Mac."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "store.db"
+        store = Store(db_path=db_path)
+        store.add_word("Alpha")  # force a write so the WAL file exists
+
+        assert db_path.stat().st_mode & 0o077 == 0
+        wal = db_path.with_name(db_path.name + "-wal")
+        if wal.exists():
+            assert wal.stat().st_mode & 0o077 == 0
 
 
 def test_bump_uses_is_case_insensitive_and_ignores_empty():

@@ -120,6 +120,69 @@ class AnthropicParseTests(unittest.TestCase):
         self.assertEqual(result.new_terms, [])
 
 
+class TruncatedResponseTests(unittest.TestCase):
+    """A response cut off at the token limit holds a *prefix* of the
+    dictation. Because that prefix is non-empty, the `cleaned or text`
+    fallback would paste it and the user would silently lose the tail."""
+
+    RAW = "der anfang des satzes und der ganze lange rest davon"
+
+    def test_anthropic_max_tokens_falls_back_to_the_raw_transcript(self):
+        resp = _Resp([
+            _Block("tool_use", input={
+                "cleaned_text": "Der Anfang des Sat",
+                "new_terms": ["Sat"],
+            }),
+        ])
+        resp.stop_reason = "max_tokens"
+
+        result = Cleaner._parse_anthropic_response(resp, self.RAW)
+
+        self.assertEqual(result.text, self.RAW)
+        self.assertEqual(result.new_terms, [])
+
+    def test_anthropic_complete_response_is_still_used(self):
+        resp = _Resp([
+            _Block("tool_use", input={
+                "cleaned_text": "Der Anfang des Satzes.",
+                "new_terms": [],
+            }),
+        ])
+        resp.stop_reason = "tool_use"
+
+        result = Cleaner._parse_anthropic_response(resp, self.RAW)
+
+        self.assertEqual(result.text, "Der Anfang des Satzes.")
+
+    def test_openai_length_finish_reason_is_treated_as_truncation(self):
+        from flow.cleanup import _was_truncated
+
+        self.assertTrue(_was_truncated({"finish_reason": "length"}))
+        self.assertFalse(_was_truncated({"finish_reason": "stop"}))
+        self.assertFalse(_was_truncated({}))
+
+
+class StoreApiKeyTests(unittest.TestCase):
+    def test_key_never_appears_in_the_command_line(self):
+        """Process arguments are readable by every other process on the Mac,
+        so a secret passed as `-w <key>` is exposed for the lifetime of the
+        call — which would defeat storing it in the Keychain at all."""
+        from unittest.mock import patch
+
+        import flow.cleanup as cleanup_mod
+
+        secret = "sk-super-secret-value"
+        with patch.object(cleanup_mod.subprocess, "run") as run:
+            cleanup_mod.store_api_key("anthropic", secret)
+
+        argv = run.call_args.args[0]
+        self.assertNotIn(secret, argv)
+        self.assertIn("-w", argv)
+        # security prompts for the value and then for a confirmation.
+        self.assertEqual(run.call_args.kwargs["input"], f"{secret}\n{secret}\n")
+        self.assertTrue(run.call_args.kwargs["check"])
+
+
 class ListFormattingPromptTests(unittest.TestCase):
     def test_system_prompt_instructs_list_formatting(self):
         from flow.cleanup import SYSTEM_PROMPT

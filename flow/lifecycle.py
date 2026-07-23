@@ -67,6 +67,11 @@ def consume_open_request(path: Path, max_age_s: float = 10.0) -> bool:
         path.unlink()
     except FileNotFoundError:
         return False
+    except OSError:
+        # Runs from a rumps timer on the main thread; anything escaping here
+        # (a permission problem, a stale mount) would surface as a crash.
+        log.exception("Could not consume the open request at %s", path)
+        return False
     return age_s <= max_age_s
 
 

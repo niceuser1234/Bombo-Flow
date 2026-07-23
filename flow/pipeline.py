@@ -5,8 +5,10 @@ State changes are reported via a callback so the menu bar can reflect them.
 """
 
 import difflib
+import functools
 import logging
 import queue
+import re
 import threading
 import time
 
@@ -48,18 +50,31 @@ def _words_changed(raw: str, cleaned: str) -> int:
     return changed
 
 
+@functools.lru_cache(maxsize=2048)
+def _term_pattern(term: str) -> "re.Pattern":
+    # Lookarounds rather than \b so terms starting or ending in punctuation
+    # (".NET", "C++") still anchor correctly.
+    return re.compile(rf"(?<!\w){re.escape(term)}(?!\w)", re.IGNORECASE)
+
+
 def _terms_in(vocabulary: list[str], text: str) -> list[str]:
-    """Vocabulary terms that appear (case-insensitively) in text."""
-    text_l = text.lower()
-    return [t for t in vocabulary if t.lower() in text_l]
+    """Vocabulary terms that appear in text, matched on word boundaries.
+
+    A plain substring test made "AI" match "again" and "Go" match "Google".
+    That inflated the usage counters which order the initial_prompt and drive
+    the least-used eviction, so two-letter terms pinned themselves to the top
+    while real multi-word terms sat at zero and were evicted first — and the
+    same phantom hits were reported as dictionary fixes in the insights panel.
+    """
+    return [t for t in vocabulary if _term_pattern(t).search(text)]
 
 
 def _dict_fixes(vocabulary: list[str], raw: str, cleaned: str) -> int:
     """Vocabulary terms that appear in the cleaned text but not in the raw
     transcript — i.e. corrections the dictionary is responsible for."""
-    raw_l = raw.lower()
     return sum(
-        1 for t in _terms_in(vocabulary, cleaned) if t.lower() not in raw_l
+        1 for t in _terms_in(vocabulary, cleaned)
+        if not _term_pattern(t).search(raw)
     )
 
 
@@ -104,6 +119,9 @@ class Pipeline:
         self._lock = threading.Lock()
         self._stopping = False  # guard against concurrent finish+start
         self._recover_timer: threading.Timer | None = None
+        # Held for the duration of an audio recovery. Acquired non-blocking,
+        # so it doubles as the "recovery in progress" flag for on_hold_start.
+        self._recovery_lock = threading.Lock()
 
     def start(self):
         # Build the native overlay before the first hotkey press so recording
@@ -146,17 +164,27 @@ class Pipeline:
             if self._stopping:
                 log.debug("on_hold_start skipped: _finish_recording in progress")
                 return
+            if self._recovery_lock.locked():
+                # Opening a stream while Pa_Terminate runs is the crash the
+                # recovery is trying to avoid in the first place.
+                log.debug("on_hold_start skipped: audio recovery in progress")
+                return
             self._press_time = time.monotonic()
+            # Before the stream opens, so the chime's attack transient is not
+            # the first thing the microphone captures. (NSSound.play is async,
+            # so a built-in mic can still pick up its tail — the alternative,
+            # chiming only after a confirmed start, put the whole blip inside
+            # every recording.)
+            if self.cfg.sounds:
+                sound.play_start()
             try:
                 self.recorder.start()
             except Exception:
                 log.exception(
                     "Could not start recording — resetting audio stack"
                 )
-                self._recover_audio()
+                self._schedule_recovery()
                 return
-            if self.cfg.sounds:
-                sound.play_start()
             # A fresh recording supersedes any pending recovery reset, so
             # cancel the stale error->idle timer before it clobbers this
             # recording's menubar state.
@@ -219,7 +247,7 @@ class Pipeline:
                     "input device?). If this repeats, check Microphone "
                     "permission in System Settings > Privacy & Security"
                 )
-                self._recover_audio()
+                self._schedule_recovery()
                 return
             self.set_state("processing")
             self._queue.put((captured, time.monotonic()))
@@ -227,11 +255,47 @@ class Pipeline:
             with self._lock:
                 self._stopping = False
 
+    def _schedule_recovery(self):
+        """Run the audio recovery on its own thread.
+
+        reset_portaudio() calls Pa_Terminate, which is precisely what blocks
+        when CoreAudio is in the wedged state this recovery exists for. Both
+        callers reach it from the SerialRunner's single hotkey-dispatch
+        thread (on_hold_start holds self._lock while doing so), so running it
+        inline would stall every further press and release behind it — the
+        app would stop responding to the hotkey altogether.
+        """
+        if not self._recovery_lock.acquire(blocking=False):
+            log.debug("Audio recovery already in progress")
+            return
+        threading.Thread(
+            target=self._run_recovery, daemon=True, name="audio-recovery"
+        ).start()
+
+    def _run_recovery(self):
+        try:
+            self._recover_audio()
+        except Exception:
+            log.exception("Audio recovery failed")
+            self._enter_error_then_idle()
+        finally:
+            self._recovery_lock.release()
+
     def _recover_audio(self):
         """A capture came back dead (silent stream or failed start): refresh
         PortAudio's stale device snapshot and swap in a fresh Recorder so
         the next dictation works without restarting the app."""
-        audio_mod.reset_portaudio()
+        stale = self.recorder
+        if stale.recording:
+            # Same reasoning as the timed-out-stop path above: terminating
+            # PortAudio underneath a live CoreAudio stream can crash. Drop the
+            # stream and leave the device snapshot alone.
+            log.warning(
+                "Skipping PortAudio reset — the previous stream is still live"
+            )
+            stale.abandon()
+        else:
+            audio_mod.reset_portaudio()
         self.recorder = Recorder()
         self._enter_error_then_idle()
 
@@ -241,6 +305,10 @@ class Pipeline:
         window can cancel it (see on_hold_start) instead of having its state
         clobbered."""
         self.set_state("error")
+        # Cancel any timer still pending from an earlier failure: an orphan
+        # would fire later and force "idle" over a live recording.
+        if self._recover_timer is not None:
+            self._recover_timer.cancel()
         self._recover_timer = threading.Timer(2.0, lambda: self.set_state("idle"))
         self._recover_timer.daemon = True
         self._recover_timer.start()
@@ -306,27 +374,38 @@ class Pipeline:
 
     def _process(self, captured, released_at):
         store = get_store()
+        # Two lists on purpose: the cleanup LLM sees the whole dictionary (it
+        # has the surrounding text and is told not to insert unspoken terms),
+        # while the STT prompt only gets terms that have been corroborated.
         vocabulary = store.dictionary_words()
         raw = self.engine.transcribe(
-            captured, initial_prompt=_build_initial_prompt(vocabulary)
+            captured, initial_prompt=_build_initial_prompt(store.stt_bias_words())
         )
         t_stt = time.monotonic()
-        log.info("STT (%.2fs): %r", t_stt - released_at, raw)
+        # Transcripts only at DEBUG: the log file outlives the dictation and
+        # holds whatever the user happened to speak. INFO keeps the timings
+        # that make the log useful for diagnosing slowness.
+        log.info("STT (%.2fs): %d chars", t_stt - released_at, len(raw))
+        log.debug("STT raw: %r", raw)
         if not raw:
             return
         text, new_terms = raw, []
         if self.cleanup_enabled:
             result = self.cleaner.clean(raw, vocabulary=vocabulary)
             text, new_terms = result.text, result.new_terms
-            log.info("Cleaned (%.2fs): %r", time.monotonic() - t_stt, text)
+            log.info("Cleaned (%.2fs): %d chars",
+                     time.monotonic() - t_stt, len(text))
+            log.debug("Cleaned text: %r", text)
         app_name = _frontmost_app()
-        insert_text(text, mode=self.cfg.insert_mode)
-        log.info("Inserted after %.2fs total", time.monotonic() - released_at)
+        # Persist before inserting. Insertion is the step that can fail for
+        # reasons outside our control (wedged main thread, refused pasteboard),
+        # and a transcript that only exists in the history is recoverable —
+        # one that was never written down is gone.
         # Metrics and auto-learning must never break the dictation path.
         try:
             store.add_dictation(
                 raw, text,
-                duration_s=len(captured) / 16000,
+                duration_s=len(captured) / self.recorder.samplerate,
                 app=app_name,
                 corrected_words=_words_changed(raw, text),
                 dict_fixes=_dict_fixes(vocabulary, raw, text),
@@ -341,3 +420,5 @@ class Pipeline:
                     log.info("Dictionary auto-learned: %s", promoted)
         except Exception:
             log.exception("Storing dictation/metrics failed")
+        insert_text(text, mode=self.cfg.insert_mode)
+        log.info("Inserted after %.2fs total", time.monotonic() - released_at)

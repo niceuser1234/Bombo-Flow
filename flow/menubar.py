@@ -18,7 +18,7 @@ from Foundation import NSDistributedNotificationCenter, NSObject
 from rumps import rumps as rumps_impl
 
 from . import config as config_mod
-from .cleanup import Cleaner, KEYCHAIN_SERVICE
+from .cleanup import Cleaner, store_api_key
 from .config import CONFIG_PATH, LOG_PATH, PROJECT_ROOT
 from .insert import accessibility_trusted
 from .lifecycle import (
@@ -162,6 +162,11 @@ class FlowApp(rumps.App):
         ]
 
         rumps.Timer(self._tick, 0.1).start()
+        # History retention also has to work for the LaunchAgent case, where
+        # the process stays up for weeks and the startup purge never runs
+        # again.
+        self._purge_timer = rumps.Timer(self._purge_history, 6 * 3600)
+        self._purge_timer.start()
         self._open_request_path = (
             config_mod.APP_SUPPORT / "open-dashboard.request"
         )
@@ -207,6 +212,16 @@ class FlowApp(rumps.App):
     def _beat(self, _timer):
         self._watchdog.beat()
 
+    def _purge_history(self, _timer):
+        try:
+            from .store import get_store
+
+            purged = get_store().purge_old(days=14)
+            if purged:
+                log.info("Purged %d history entries older than 14 days", purged)
+        except Exception:
+            log.exception("Periodic history purge failed")
+
     # -- cleanup / API key --
 
     def _refresh_cleanup_item(self):
@@ -245,11 +260,7 @@ class FlowApp(rumps.App):
         if not resp.clicked or not key:
             return
         try:
-            subprocess.run(
-                ["security", "add-generic-password", "-U",
-                 "-s", KEYCHAIN_SERVICE, "-a", provider, "-w", key],
-                check=True, capture_output=True, timeout=5,
-            )
+            store_api_key(provider, key)
         except Exception:
             log.exception("Storing API key in Keychain failed")
             rumps.alert("Could not store key", f"See log: {LOG_PATH}")
@@ -347,11 +358,16 @@ class FlowApp(rumps.App):
         subprocess.run(["open", str(LOG_PATH)])
 
     def _install_emergency_quit(self):
-        """Global Cmd+Alt+Shift+Q force-exits without going through the menu.
+        """Cmd+Alt+Shift+Q force-exits without going through the menu.
 
-        This only helps while the app still responds: global monitors are
-        delivered on the main thread, so a wedged main loop never runs this
-        handler. Recovering from that case is MainLoopWatchdog's job.
+        This only helps while the app still responds: monitors are delivered
+        on the main thread, so a wedged main loop never runs this handler.
+        Recovering from that case is MainLoopWatchdog's job.
+
+        Both a global and a local monitor are registered. A global monitor
+        only sees events aimed at *other* apps, so on its own the shortcut
+        would be dead whenever Bomboclat Flow itself is frontmost — which is
+        precisely when a user reaches for it.
         """
         import logging as _logging
         import os as _os
@@ -379,16 +395,25 @@ class FlowApp(rumps.App):
             _log.warning("Emergency quit (Cmd+Alt+Shift+Q) — force-exiting")
             _os._exit(1)
 
-        self._emergency_monitor = (
+        def _handle_local(event):
+            _handle(event)
+            return event  # pass through, or we swallow keys in our own window
+
+        self._emergency_monitors = [
             NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
                 NSEventMaskKeyDown, _handle
-            )
-        )
+            ),
+            NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                NSEventMaskKeyDown, _handle_local
+            ),
+        ]
         _log.info("Emergency quit handler installed (Cmd+Alt+Shift+Q)")
 
     def _quit(self, _item):
-        if hasattr(self, "_emergency_monitor") and self._emergency_monitor is not None:
-            from AppKit import NSEvent
-            NSEvent.removeMonitor_(self._emergency_monitor)
+        from AppKit import NSEvent
+
+        for monitor in getattr(self, "_emergency_monitors", []):
+            if monitor is not None:
+                NSEvent.removeMonitor_(monitor)
         self._notification_center.removeObserver_(self._open_observer)
         rumps.quit_application()

@@ -127,6 +127,37 @@ def load_api_key(provider: str) -> str | None:
     return os.environ.get(env_var) or _keychain_key(account)
 
 
+def store_api_key(provider: str, key: str) -> None:
+    """Write an API key to the Keychain.
+
+    The key goes in over stdin rather than as `-w <key>`: process arguments
+    are readable by any other process on this Mac (ps, sysctl), so passing a
+    secret there would undo the point of using the Keychain. `security`
+    prompts for the value and then for a confirmation, hence twice.
+
+    Raises subprocess.CalledProcessError when the write fails.
+    """
+    subprocess.run(
+        ["security", "add-generic-password", "-U",
+         "-s", KEYCHAIN_SERVICE, "-a", provider, "-w"],
+        input=f"{key}\n{key}\n", text=True,
+        check=True, capture_output=True, timeout=5,
+    )
+
+
+def _was_truncated(choice: dict) -> bool:
+    """Whether the provider cut the response off at the token limit. The
+    partial text is a prefix of the dictation, so pasting it would silently
+    drop the tail."""
+    if choice.get("finish_reason") != "length":
+        return False
+    log.warning(
+        "Cleanup response hit the token limit — using the raw transcript "
+        "rather than a truncated one"
+    )
+    return True
+
+
 class Cleaner:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -197,6 +228,16 @@ class Cleaner:
         If the model ignored tool forcing (or the SDK response is shaped
         unexpectedly), fall back to any plain text block, then to the raw
         transcript — cleanup must never break dictation."""
+        if getattr(resp, "stop_reason", None) == "max_tokens":
+            # The tool_use JSON is cut off mid-value. cleaned_text then holds
+            # a prefix of the dictation, and since it is non-empty the
+            # `cleaned or text` fallback below would happily paste it — the
+            # user silently loses the tail of what they said.
+            log.warning(
+                "Cleanup response hit max_tokens — using the raw transcript "
+                "rather than a truncated one"
+            )
+            return CleanResult(text, [])
         for block in resp.content:
             if getattr(block, "type", None) == "tool_use":
                 obj = getattr(block, "input", None) or {}
@@ -253,10 +294,16 @@ class Cleaner:
                 {"role": "user", "content": text},
             ]
             data = self._post_openai(plain_body)
-            content = (data["choices"][0]["message"]["content"] or "").strip()
+            choice = data["choices"][0]
+            if _was_truncated(choice):
+                return CleanResult(text, [])
+            content = (choice["message"]["content"] or "").strip()
             return CleanResult(content or text, [])
 
-        content = data["choices"][0]["message"]["content"] or ""
+        choice = data["choices"][0]
+        if _was_truncated(choice):
+            return CleanResult(text, [])
+        content = choice["message"]["content"] or ""
         return self._parse_content(content, text)
 
     @staticmethod
