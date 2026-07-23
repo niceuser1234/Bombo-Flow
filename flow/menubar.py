@@ -162,6 +162,11 @@ class FlowApp(rumps.App):
         ]
 
         rumps.Timer(self._tick, 0.1).start()
+        # History retention also has to work for the LaunchAgent case, where
+        # the process stays up for weeks and the startup purge never runs
+        # again.
+        self._purge_timer = rumps.Timer(self._purge_history, 6 * 3600)
+        self._purge_timer.start()
         self._open_request_path = (
             config_mod.APP_SUPPORT / "open-dashboard.request"
         )
@@ -206,6 +211,16 @@ class FlowApp(rumps.App):
 
     def _beat(self, _timer):
         self._watchdog.beat()
+
+    def _purge_history(self, _timer):
+        try:
+            from .store import get_store
+
+            purged = get_store().purge_old(days=14)
+            if purged:
+                log.info("Purged %d history entries older than 14 days", purged)
+        except Exception:
+            log.exception("Periodic history purge failed")
 
     # -- cleanup / API key --
 
