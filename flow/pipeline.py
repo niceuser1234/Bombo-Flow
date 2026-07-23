@@ -5,8 +5,10 @@ State changes are reported via a callback so the menu bar can reflect them.
 """
 
 import difflib
+import functools
 import logging
 import queue
+import re
 import threading
 import time
 
@@ -48,18 +50,31 @@ def _words_changed(raw: str, cleaned: str) -> int:
     return changed
 
 
+@functools.lru_cache(maxsize=2048)
+def _term_pattern(term: str) -> "re.Pattern":
+    # Lookarounds rather than \b so terms starting or ending in punctuation
+    # (".NET", "C++") still anchor correctly.
+    return re.compile(rf"(?<!\w){re.escape(term)}(?!\w)", re.IGNORECASE)
+
+
 def _terms_in(vocabulary: list[str], text: str) -> list[str]:
-    """Vocabulary terms that appear (case-insensitively) in text."""
-    text_l = text.lower()
-    return [t for t in vocabulary if t.lower() in text_l]
+    """Vocabulary terms that appear in text, matched on word boundaries.
+
+    A plain substring test made "AI" match "again" and "Go" match "Google".
+    That inflated the usage counters which order the initial_prompt and drive
+    the least-used eviction, so two-letter terms pinned themselves to the top
+    while real multi-word terms sat at zero and were evicted first — and the
+    same phantom hits were reported as dictionary fixes in the insights panel.
+    """
+    return [t for t in vocabulary if _term_pattern(t).search(text)]
 
 
 def _dict_fixes(vocabulary: list[str], raw: str, cleaned: str) -> int:
     """Vocabulary terms that appear in the cleaned text but not in the raw
     transcript — i.e. corrections the dictionary is responsible for."""
-    raw_l = raw.lower()
     return sum(
-        1 for t in _terms_in(vocabulary, cleaned) if t.lower() not in raw_l
+        1 for t in _terms_in(vocabulary, cleaned)
+        if not _term_pattern(t).search(raw)
     )
 
 
@@ -359,9 +374,12 @@ class Pipeline:
 
     def _process(self, captured, released_at):
         store = get_store()
+        # Two lists on purpose: the cleanup LLM sees the whole dictionary (it
+        # has the surrounding text and is told not to insert unspoken terms),
+        # while the STT prompt only gets terms that have been corroborated.
         vocabulary = store.dictionary_words()
         raw = self.engine.transcribe(
-            captured, initial_prompt=_build_initial_prompt(vocabulary)
+            captured, initial_prompt=_build_initial_prompt(store.stt_bias_words())
         )
         t_stt = time.monotonic()
         # Transcripts only at DEBUG: the log file outlives the dictation and

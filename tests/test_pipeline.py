@@ -6,7 +6,13 @@ from unittest.mock import patch
 
 import numpy as np
 
-from flow.pipeline import STOP_TIMEOUT_S, Pipeline, _build_initial_prompt
+from flow.pipeline import (
+    STOP_TIMEOUT_S,
+    Pipeline,
+    _build_initial_prompt,
+    _dict_fixes,
+    _terms_in,
+)
 
 
 class _Overlay:
@@ -72,6 +78,9 @@ class _FakeStore:
         self.bumped = []
 
     def dictionary_words(self):
+        return list(self._words)
+
+    def stt_bias_words(self):
         return list(self._words)
 
     def add_dictation(self, *args, **kwargs):
@@ -423,6 +432,39 @@ class UsageBumpTests(unittest.TestCase):
     def test_no_bump_when_no_term_appears(self):
         store = self._run(["Kubernetes"], spoken="hallo welt wie geht es")
         self.assertEqual(store.bumped, [])
+
+    def test_short_terms_do_not_match_inside_longer_words(self):
+        """Substring matching made "AI" match "again" and "Go" match
+        "Google", inflating the counters that order the initial_prompt and
+        drive the least-used eviction."""
+        store = self._run(["AI", "Go"], spoken="again i googled it")
+        self.assertEqual(store.bumped, [])
+
+    def test_terms_still_match_next_to_punctuation(self):
+        store = self._run(["Kubernetes"], spoken="wir nutzen Kubernetes, oder?")
+        self.assertEqual(store.bumped, [["Kubernetes"]])
+
+
+class TermMatchingTests(unittest.TestCase):
+    def test_word_boundaries_are_respected(self):
+        self.assertEqual(_terms_in(["AI"], "again and again"), [])
+        self.assertEqual(_terms_in(["Go"], "I googled it"), [])
+        self.assertEqual(_terms_in(["AI"], "the AI model"), ["AI"])
+
+    def test_matching_stays_case_insensitive(self):
+        self.assertEqual(_terms_in(["Kubernetes"], "auf kubernetes"), ["Kubernetes"])
+
+    def test_terms_with_punctuation_anchor_correctly(self):
+        self.assertEqual(_terms_in([".NET"], "das .NET framework"), [".NET"])
+        self.assertEqual(_terms_in(["C++"], "in C++ geschrieben"), ["C++"])
+
+    def test_dict_fixes_counts_only_terms_the_cleanup_added(self):
+        # "Kubernetes" was already in the raw transcript — not a fix.
+        self.assertEqual(_dict_fixes(["Kubernetes"], "kubernetes läuft",
+                                     "Kubernetes läuft"), 0)
+        # "n8n" only appears after cleanup — that is a dictionary fix.
+        self.assertEqual(_dict_fixes(["n8n"], "acht en acht läuft",
+                                     "n8n läuft"), 1)
 
 
 class AudioRecoveryTests(unittest.TestCase):
