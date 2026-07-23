@@ -1,5 +1,6 @@
 import threading
 import unittest
+from unittest import mock
 from unittest.mock import patch
 
 import numpy as np
@@ -79,6 +80,44 @@ class RecorderAbandonTests(unittest.TestCase):
         self.assertTrue(done.wait(2.0), "stream was not closed in background")
         self.assertEqual(fake_stream.abort_calls, 1)
         self.assertEqual(fake_stream.close_calls, 1)
+
+
+class RecorderStartFailureTests(unittest.TestCase):
+    """A stream that was constructed but failed to start must not be left in
+    self._stream: the caller's recovery path would then call reset_portaudio()
+    — Pa_Terminate — with a live CoreAudio stream, which is exactly the crash
+    the recovery exists to avoid."""
+
+    class _FailingStream:
+        def __init__(self):
+            self.close_calls = 0
+
+        def start(self):
+            raise RuntimeError("device is busy")
+
+        def close(self, ignore_errors=False):
+            self.close_calls += 1
+
+    def test_failed_start_closes_the_stream_and_leaves_recorder_idle(self):
+        rec = audio.Recorder()
+        stream = self._FailingStream()
+        with patch.object(audio.sd, "InputStream", return_value=stream):
+            with self.assertRaises(RuntimeError):
+                rec.start()
+
+        self.assertIsNone(rec._stream)
+        self.assertFalse(rec.recording)
+        self.assertEqual(stream.close_calls, 1)
+
+    def test_successful_start_publishes_the_stream(self):
+        rec = audio.Recorder()
+        stream = mock.Mock()
+        with patch.object(audio.sd, "InputStream", return_value=stream):
+            rec.start()
+
+        self.assertIs(rec._stream, stream)
+        self.assertTrue(rec.recording)
+        stream.start.assert_called_once_with()
 
 
 class ResetPortaudioTests(unittest.TestCase):
