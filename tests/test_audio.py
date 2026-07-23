@@ -1,4 +1,5 @@
 import threading
+import time
 import unittest
 from unittest import mock
 from unittest.mock import patch
@@ -80,6 +81,38 @@ class RecorderAbandonTests(unittest.TestCase):
         self.assertTrue(done.wait(2.0), "stream was not closed in background")
         self.assertEqual(fake_stream.abort_calls, 1)
         self.assertEqual(fake_stream.close_calls, 1)
+
+
+class RecorderMuteTests(unittest.TestCase):
+    """The start chime plays into an already-open microphone. Dropping those
+    frames keeps it out of the transcript without clipping the sound itself."""
+
+    def test_muted_window_is_dropped_then_capture_resumes(self):
+        rec = audio.Recorder()
+        loud = np.full((160, 1), 0.5, dtype=np.float32)
+
+        rec.mute_for(0.05)
+        rec._callback(loud, 160, None, None)
+        self.assertEqual(rec._chunks, [], "chime frames were captured")
+        self.assertEqual(rec.level, 0.0)
+
+        time.sleep(0.06)
+        rec._callback(loud, 160, None, None)
+        self.assertEqual(len(rec._chunks), 1, "capture did not resume")
+        self.assertGreater(rec.level, 0.0)
+
+    def test_zero_duration_does_not_mute(self):
+        rec = audio.Recorder()
+        rec.mute_for(0.0)
+        rec._callback(np.full((160, 1), 0.5, dtype=np.float32), 160, None, None)
+        self.assertEqual(len(rec._chunks), 1)
+
+    def test_start_clears_a_stale_mute(self):
+        rec = audio.Recorder()
+        rec.mute_for(30.0)
+        with patch.object(audio.sd, "InputStream", return_value=mock.Mock()):
+            rec.start()
+        self.assertEqual(rec._muted_until, 0.0)
 
 
 class RecorderStartFailureTests(unittest.TestCase):

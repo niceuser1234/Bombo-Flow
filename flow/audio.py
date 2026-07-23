@@ -6,6 +6,7 @@ missing, so callers should check `is_silent()` on the result.
 
 import logging
 import threading
+import time
 
 import numpy as np
 import sounddevice as sd
@@ -51,6 +52,8 @@ class Recorder:
         self.level: float = 0.0
         # Set by abandon() to make a wedged recorder's callback a no-op.
         self._discard = False
+        # Deadline set by mute_for(): captured audio before it is dropped.
+        self._muted_until = 0.0
 
     @property
     def recording(self) -> bool:
@@ -62,6 +65,7 @@ class Recorder:
         self._chunks = []
         self.level = 0.0
         self._discard = False
+        self._muted_until = 0.0
         stream = sd.InputStream(
             samplerate=self.samplerate,
             channels=1,
@@ -82,11 +86,26 @@ class Recorder:
             raise
         self._stream = stream
 
+    def mute_for(self, seconds: float):
+        """Drop captured audio for the next `seconds`.
+
+        Used for the start chime. The chime cannot simply be played before
+        the stream opens: opening the input device reconfigures CoreAudio,
+        which cuts off a sound that is already playing — audibly so, since
+        most of the chime is a soft release tail. So the stream opens first,
+        the chime plays into an open microphone, and this keeps it out of the
+        recording instead.
+        """
+        if seconds > 0:
+            self._muted_until = time.monotonic() + seconds
+
     def _callback(self, indata, frames, time_info, status):
         if self._discard:
             return
         if status:
             log.warning("audio status: %s", status)
+        if self._muted_until and time.monotonic() < self._muted_until:
+            return
         self._chunks.append(indata.copy())
         new = compute_normalized_level(indata)
         # Fast attack + slower release: reacts immediately without jittering.

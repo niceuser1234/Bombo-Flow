@@ -36,6 +36,10 @@ class _Recorder:
         self._recording = False
         self.stops = 0
         self.abandoned = 0
+        self.muted_for = None
+
+    def mute_for(self, seconds):
+        self.muted_for = seconds
 
     @property
     def recording(self):
@@ -156,18 +160,55 @@ class HoldStartGuardTests(unittest.TestCase):
 
 
 class SoundHookTests(unittest.TestCase):
-    def test_start_sound_plays_before_the_stream_opens(self):
-        """The chime must be emitted before the microphone stream starts,
-        otherwise its attack transient is captured and transcribed at the head
-        of every recording."""
+    def test_start_sound_plays_after_the_stream_opens(self):
+        """Opening the input device reconfigures CoreAudio and truncates a
+        sound that is already playing, which audibly clips the chime's release
+        tail. So the stream opens first and the chime follows."""
         pipeline = _build_pipeline()
         pipeline.engine = True
         order = []
         pipeline.recorder.start = lambda: order.append("recorder.start")
         with patch("flow.pipeline.sound.play_start",
-                   side_effect=lambda: order.append("play_start")):
+                   side_effect=lambda: order.append("play_start")), \
+                patch("flow.pipeline.sound.start_duration_s", return_value=0.23):
             pipeline.on_hold_start()
-        self.assertEqual(order, ["play_start", "recorder.start"])
+        self.assertEqual(order, ["recorder.start", "play_start"])
+
+    def test_capture_is_muted_for_the_length_of_the_chime(self):
+        """The chime plays into an open microphone, so it must be dropped
+        from the capture rather than transcribed at the head of the
+        recording."""
+        pipeline = _build_pipeline()
+        pipeline.engine = True
+        with patch("flow.pipeline.sound.play_start"), \
+                patch("flow.pipeline.sound.start_duration_s", return_value=0.23):
+            pipeline.on_hold_start()
+        self.assertAlmostEqual(
+            pipeline.recorder.muted_for, 0.23 + 0.05, places=6
+        )
+
+    def test_no_mute_when_sounds_are_disabled(self):
+        """Nothing is played, so nothing may be cut from the recording."""
+        pipeline = _build_pipeline()
+        pipeline.engine = True
+        pipeline.cfg.sounds = False
+        with patch("flow.pipeline.sound.play_start") as play_start:
+            pipeline.on_hold_start()
+        play_start.assert_not_called()
+        self.assertIsNone(pipeline.recorder.muted_for)
+
+    def test_start_sound_not_played_when_recorder_start_fails(self):
+        """The chime says "recording has started" — it must not sound when it
+        has not."""
+        pipeline = _build_pipeline()
+        pipeline.engine = True
+        pipeline.recorder.start = lambda: (_ for _ in ()).throw(RuntimeError("mic busy"))
+        with patch("flow.pipeline.sound.play_start") as play_start, \
+                patch("flow.pipeline.audio_mod.reset_portaudio"), \
+                patch("flow.pipeline.Recorder", _Recorder):
+            pipeline.on_hold_start()
+            _wait_for_recovery(pipeline)
+        play_start.assert_not_called()
 
     def test_start_sound_is_skipped_when_recovery_is_running(self):
         pipeline = _build_pipeline()

@@ -10,6 +10,7 @@ logged so it can never break dictation.
 
 import logging
 import sys
+import wave
 from pathlib import Path
 
 from .config import PROJECT_ROOT
@@ -53,6 +54,31 @@ def _ensure_loaded():
     _stop_sound = _load(_STOP_NAME)
     if _start_sound is None or _stop_sound is None:
         log.warning("Recording sound asset(s) missing or failed to load")
+
+
+_start_duration_s = None
+
+
+def _wav_duration_s(path: Path) -> float:
+    try:
+        with wave.open(str(path)) as w:
+            return w.getnframes() / float(w.getframerate())
+    except Exception:
+        log.exception("Could not read the duration of %s", path)
+        return 0.0
+
+
+def start_duration_s() -> float:
+    """Length of the start chime, read from the asset itself so it stays
+    correct when packaging/make_sounds.py changes the sound design.
+
+    The recorder uses this to mute its capture for exactly as long as the
+    chime sounds — see Recorder.mute_for.
+    """
+    global _start_duration_s
+    if _start_duration_s is None:
+        _start_duration_s = _wav_duration_s(_assets_dir() / _START_NAME)
+    return _start_duration_s
 
 
 def play_start():

@@ -27,6 +27,10 @@ log = logging.getLogger(__name__)
 # States: loading, idle, recording, processing, error
 
 STOP_TIMEOUT_S = 2.0  # max seconds to wait for recorder.stop() before giving up.
+# Added to the chime's own length when muting the capture: the sound travels
+# from the speakers back to the microphone, and playback starts a moment after
+# play() returns.
+CHIME_GUARD_S = 0.05
 
 
 def _frontmost_app() -> str | None:
@@ -170,13 +174,6 @@ class Pipeline:
                 log.debug("on_hold_start skipped: audio recovery in progress")
                 return
             self._press_time = time.monotonic()
-            # Before the stream opens, so the chime's attack transient is not
-            # the first thing the microphone captures. (NSSound.play is async,
-            # so a built-in mic can still pick up its tail — the alternative,
-            # chiming only after a confirmed start, put the whole blip inside
-            # every recording.)
-            if self.cfg.sounds:
-                sound.play_start()
             try:
                 self.recorder.start()
             except Exception:
@@ -185,6 +182,15 @@ class Pipeline:
                 )
                 self._schedule_recovery()
                 return
+            if self.cfg.sounds:
+                # After the stream is open, never before: opening the input
+                # device reconfigures CoreAudio and truncates a sound that is
+                # already playing, which clips the chime's release tail. Mute
+                # the capture for its duration instead, so it still stays out
+                # of the recording. Also keeps the chime honest — it only
+                # sounds once recording has actually started.
+                self.recorder.mute_for(sound.start_duration_s() + CHIME_GUARD_S)
+                sound.play_start()
             # A fresh recording supersedes any pending recovery reset, so
             # cancel the stale error->idle timer before it clobbers this
             # recording's menubar state.
