@@ -28,11 +28,14 @@ Legende: **K** = kritisch (Datenverlust/Absturz), **H** = hoch (Funktion bricht 
 
 Drei Stellen mit bewusst geänderter Semantik — bitte gegenprüfen:
 
-1. **Startton (M-4)** spielt jetzt *vor* dem Öffnen des Streams. Damit landet der
-   Ton nicht mehr in der Aufnahme, er erklingt aber auch auf dem seltenen Pfad,
-   auf dem `recorder.start()` fehlschlägt. Die Fehlermeldung tragen dort das
-   ⚠️-Icon und der Log. Alternative wäre, die ersten ~230 ms der Aufnahme zu
-   verwerfen — das kostet echte Sprache und wäre der schlechtere Tausch.
+1. **Startton (M-4)** — erst vor `recorder.start()` gezogen, nach Praxistest
+   wieder zurückgestellt. Das Öffnen des Eingabegeräts konfiguriert CoreAudio um
+   und schneidet einen laufenden Ton ab; da 0,14 s der 0,23 s reiner
+   Release-Ausklang sind, war das deutlich hörbar. Endstand: Stream zuerst,
+   Chime danach, und der Recorder verwirft die ersten 0,28 s der Aufnahme
+   (`Recorder.mute_for`, Länge aus dem WAV-Header). Damit bleibt der Ton
+   vollständig, landet trotzdem nicht im Transkript, und die Bedeutung „Aufnahme
+   läuft" stimmt wieder — bei fehlgeschlagenem Start schweigt er.
 2. **Promotion ins Wörterbuch (H-6/H-7)** ist nicht mehr pauschal `PROMOTE_AT = 1`.
    Begriffe mit markanter Form (`n8n`, `LangGraph`, `API`) kommen weiter beim
    ersten Hören rein; gewöhnlich aussehende Wörter brauchen wieder zwei
