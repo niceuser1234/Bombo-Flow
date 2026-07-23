@@ -38,6 +38,10 @@ class Config:
     hotkey: str = "fn"
     min_duration_s: float = 0.3
     max_duration_s: float = 120.0
+    # Microphone to record from (case-insensitive substring of the device
+    # name). Empty = system default. See resolve_input_device in audio.py for
+    # why pointing this at the built-in mic matters when wearing AirPods.
+    input_device: str = ""
     engine: str = "whisper"
     parakeet_model: str = "mlx-community/parakeet-tdt-0.6b-v3"
     whisper_model: str = "mlx-community/whisper-large-v3-turbo-q4"
@@ -91,6 +95,7 @@ def load() -> Config:
     cfg.min_duration_s = float(audio.get("min_duration_s", cfg.min_duration_s))
     cfg.max_duration_s = float(audio.get("max_duration_s", cfg.max_duration_s))
     cfg.sounds = bool(audio.get("sounds", cfg.sounds))
+    cfg.input_device = str(audio.get("input_device", cfg.input_device))
     cfg.engine = stt.get("engine", cfg.engine)
     cfg.parakeet_model = stt.get("parakeet_model", cfg.parakeet_model)
     cfg.whisper_model = stt.get("whisper_model", cfg.whisper_model)

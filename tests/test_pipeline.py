@@ -32,11 +32,12 @@ class _Overlay:
 class _Recorder:
     samplerate = 16000
 
-    def __init__(self):
+    def __init__(self, device_name=None):
         self._recording = False
         self.stops = 0
         self.abandoned = 0
         self.muted_for = None
+        self.device_name = device_name
 
     def mute_for(self, seconds):
         self.muted_for = seconds
@@ -64,6 +65,7 @@ class _Recorder:
 class _Config:
     min_duration_s = 0.3
     max_duration_s = 120.0
+    input_device = ""
     engine = "parakeet"
     parakeet_model = "test"
     whisper_model = "test"

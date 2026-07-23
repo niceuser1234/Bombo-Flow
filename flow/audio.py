@@ -42,9 +42,47 @@ def apply_attack_release(
     return _clamp01(prev + alpha * (target - prev))
 
 
+def resolve_input_device(name: str | None):
+    """Map a configured microphone name to a PortAudio device index.
+
+    Matching is a case-insensitive substring, so "MacBook Air" is enough.
+    Returns None — PortAudio's default — when unset or when nothing matches.
+
+    Why this exists: recording from a Bluetooth headset forces macOS to
+    switch it out of A2DP into the hands-free profile. Music playing through
+    the same headset then drops to mono and changes volume mid-sentence, and
+    the headset microphone itself falls back to narrowband, so the
+    transcription gets worse too. Recording from the built-in microphone
+    instead leaves the headset in full-quality playback mode.
+    """
+    if not name or not name.strip():
+        return None
+    wanted = name.strip().lower()
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        log.exception("Could not query audio devices — using the default input")
+        return None
+    for index, device in enumerate(devices):
+        if device.get("max_input_channels", 0) <= 0:
+            continue
+        if wanted in str(device.get("name", "")).lower():
+            return index
+    log.warning(
+        "Configured input device %r not found — falling back to the system "
+        "default. Available inputs: %s",
+        name,
+        [d["name"] for d in devices if d.get("max_input_channels", 0) > 0],
+    )
+    return None
+
+
 class Recorder:
-    def __init__(self, samplerate: int = SAMPLE_RATE):
+    def __init__(self, samplerate: int = SAMPLE_RATE, device_name: str | None = None):
         self.samplerate = samplerate
+        # Resolved on every start(): the device list changes as headsets
+        # connect and disconnect, and reset_portaudio() rebuilds it entirely.
+        self.device_name = device_name
         self._chunks: list[np.ndarray] = []
         self._stream: sd.InputStream | None = None
         # Live mic level in 0.0..1.0, updated from the audio callback and read
@@ -71,6 +109,7 @@ class Recorder:
             channels=1,
             dtype="float32",
             callback=self._callback,
+            device=resolve_input_device(self.device_name),
         )
         try:
             stream.start()

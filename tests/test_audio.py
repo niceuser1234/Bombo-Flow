@@ -83,6 +83,53 @@ class RecorderAbandonTests(unittest.TestCase):
         self.assertEqual(fake_stream.close_calls, 1)
 
 
+class ResolveInputDeviceTests(unittest.TestCase):
+    """Recording from a Bluetooth headset forces macOS out of A2DP into the
+    hands-free profile: music through the same headset changes volume
+    mid-sentence and the headset mic drops to narrowband."""
+
+    DEVICES = [
+        {"name": "AirPods Pro von Jonathan", "max_input_channels": 1},
+        {"name": "AirPods Pro von Jonathan", "max_input_channels": 0},
+        {"name": "MacBook Air-Mikrofon", "max_input_channels": 1},
+        {"name": "MacBook Air-Lautsprecher", "max_input_channels": 0},
+    ]
+
+    def _resolve(self, name):
+        with patch.object(audio.sd, "query_devices", return_value=self.DEVICES):
+            return audio.resolve_input_device(name)
+
+    def test_substring_match_is_enough(self):
+        self.assertEqual(self._resolve("MacBook Air"), 2)
+
+    def test_match_is_case_insensitive(self):
+        self.assertEqual(self._resolve("macbook air-mikrofon"), 2)
+
+    def test_output_only_devices_are_skipped(self):
+        self.assertEqual(self._resolve("AirPods"), 0)  # the input entry, not [1]
+
+    def test_empty_setting_uses_the_system_default(self):
+        self.assertIsNone(self._resolve(""))
+        self.assertIsNone(self._resolve(None))
+        self.assertIsNone(self._resolve("   "))
+
+    def test_unknown_device_falls_back_to_the_default(self):
+        self.assertIsNone(self._resolve("Rode NT-USB"))
+
+    def test_query_failure_falls_back_to_the_default(self):
+        with patch.object(audio.sd, "query_devices",
+                          side_effect=RuntimeError("PortAudio down")):
+            self.assertIsNone(audio.resolve_input_device("MacBook Air"))
+
+    def test_recorder_passes_the_resolved_device_to_the_stream(self):
+        rec = audio.Recorder(device_name="MacBook Air")
+        with patch.object(audio.sd, "query_devices", return_value=self.DEVICES), \
+                patch.object(audio.sd, "InputStream",
+                             return_value=mock.Mock()) as stream_cls:
+            rec.start()
+        self.assertEqual(stream_cls.call_args.kwargs["device"], 2)
+
+
 class RecorderMuteTests(unittest.TestCase):
     """The start chime plays into an already-open microphone. Dropping those
     frames keeps it out of the transcript without clipping the sound itself."""

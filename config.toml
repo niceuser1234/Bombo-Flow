@@ -18,6 +18,16 @@ min_duration_s = 0.3
 max_duration_s = 120
 # Play a subtle start/stop blip when recording begins/ends.
 sounds = true
+# Which microphone to record from — a case-insensitive part of the device
+# name is enough ("MacBook Air"). Empty means the system default.
+#
+# Worth setting when you wear AirPods or another Bluetooth headset: opening
+# their microphone forces macOS out of A2DP into the hands-free profile, so
+# music playing through the same headset suddenly changes volume and drops to
+# mono, and the headset mic itself falls back to narrowband — which makes the
+# transcription noticeably worse. Recording from the built-in microphone
+# leaves the headset in full-quality playback mode.
+input_device = ""
 
 [stt]
 # "whisper" (recommended, better with mixed-language utterances, requires:

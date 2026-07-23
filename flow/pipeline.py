@@ -112,7 +112,7 @@ class Pipeline:
     def __init__(self, cfg, set_state):
         self.cfg = cfg
         self.set_state = set_state
-        self.recorder = Recorder()
+        self.recorder = self._new_recorder()
         self.cleaner = Cleaner(cfg)
         self.overlay = Overlay(level_source=lambda: self.recorder.level)
         self.engine = None
@@ -126,6 +126,11 @@ class Pipeline:
         # Held for the duration of an audio recovery. Acquired non-blocking,
         # so it doubles as the "recovery in progress" flag for on_hold_start.
         self._recovery_lock = threading.Lock()
+
+    def _new_recorder(self) -> Recorder:
+        """Every Recorder — the initial one and each replacement built during
+        recovery — has to carry the configured microphone."""
+        return Recorder(device_name=self.cfg.input_device)
 
     def start(self):
         # Build the native overlay before the first hotkey press so recording
@@ -302,7 +307,7 @@ class Pipeline:
             stale.abandon()
         else:
             audio_mod.reset_portaudio()
-        self.recorder = Recorder()
+        self.recorder = self._new_recorder()
         self._enter_error_then_idle()
 
     def _enter_error_then_idle(self):
@@ -355,7 +360,7 @@ class Pipeline:
             stuck.abandon()
             # The overlay's level_source closes over `self`, so it follows the
             # swap without further wiring.
-            self.recorder = Recorder()
+            self.recorder = self._new_recorder()
             return np.zeros(0, dtype=np.float32)
         if result:
             return result[0]

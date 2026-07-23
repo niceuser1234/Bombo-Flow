@@ -145,17 +145,43 @@ def store_api_key(provider: str, key: str) -> None:
     )
 
 
+# Providers disagree on the wording: OpenAI says "length", Gemini and some
+# OpenRouter passthroughs say "max_tokens".
+_TRUNCATED_REASONS = {"length", "max_tokens"}
+
+
 def _was_truncated(choice: dict) -> bool:
     """Whether the provider cut the response off at the token limit. The
     partial text is a prefix of the dictation, so pasting it would silently
     drop the tail."""
-    if choice.get("finish_reason") != "length":
+    if str(choice.get("finish_reason") or "").lower() not in _TRUNCATED_REASONS:
         return False
     log.warning(
         "Cleanup response hit the token limit — using the raw transcript "
         "rather than a truncated one"
     )
     return True
+
+
+def _strip_code_fence(content: str) -> str:
+    """Unwrap ```json … ``` — models add it even when asked for raw JSON."""
+    if not content.startswith("```"):
+        return content
+    body = content.split("\n", 1)[1] if "\n" in content else ""
+    if body.rstrip().endswith("```"):
+        body = body.rstrip()[:-3]
+    return body.strip()
+
+
+def _looks_like_json(content: str) -> bool:
+    """Whether content was *meant* to be our JSON envelope. Used to tell a
+    broken structured reply from a provider that ignored response_format and
+    answered in prose."""
+    return (
+        content[:1] in ("{", "[")
+        or "cleaned_text" in content
+        or "new_terms" in content
+    )
 
 
 class Cleaner:
@@ -308,13 +334,31 @@ class Cleaner:
 
     @staticmethod
     def _parse_content(content: str, text: str) -> CleanResult:
-        """Content may be a JSON {cleaned_text, new_terms} object or plain text."""
-        content = content.strip()
+        """Parse the structured reply, or fall back to the raw transcript.
+
+        Anything that was meant to be our JSON envelope but cannot be parsed
+        into it must never reach the user's cursor. Returning the content
+        verbatim once pasted a half-written '{\\n  "cleaned_' into a
+        document: the model's reply had been cut short and the provider did
+        not report it in finish_reason, so _was_truncated could not catch it.
+
+        A reply that does not look like JSON at all is a different case — the
+        provider ignored response_format and answered in prose, which is
+        still a perfectly good cleaned transcript.
+        """
+        content = _strip_code_fence(content.strip())
         if not content:
             return CleanResult(text, [])
         try:
             obj = json.loads(content)
         except (json.JSONDecodeError, ValueError):
+            if _looks_like_json(content):
+                log.warning(
+                    "Cleanup returned unparseable JSON (%d chars) — using the "
+                    "raw transcript", len(content),
+                )
+                log.debug("Unparseable cleanup content: %r", content[:500])
+                return CleanResult(text, [])
             return CleanResult(content, [])
         if isinstance(obj, dict) and "cleaned_text" in obj:
             cleaned = (obj.get("cleaned_text") or "").strip()
@@ -322,5 +366,7 @@ class Cleaner:
             terms = ([str(t) for t in raw_terms if isinstance(t, str)]
                      if isinstance(raw_terms, list) else [])
             return CleanResult(cleaned or text, terms)
-        # Valid JSON but not our shape — fall back to treating it as text.
-        return CleanResult(content, [])
+        # Valid JSON, wrong shape — still not something to paste.
+        log.warning("Cleanup returned JSON without cleaned_text — using the "
+                    "raw transcript")
+        return CleanResult(text, [])

@@ -161,6 +161,61 @@ class TruncatedResponseTests(unittest.TestCase):
         self.assertFalse(_was_truncated({"finish_reason": "stop"}))
         self.assertFalse(_was_truncated({}))
 
+    def test_gemini_style_max_tokens_reason_is_recognised(self):
+        """Gemini and some OpenRouter passthroughs word it differently."""
+        from flow.cleanup import _was_truncated
+
+        self.assertTrue(_was_truncated({"finish_reason": "MAX_TOKENS"}))
+        self.assertTrue(_was_truncated({"finish_reason": "max_tokens"}))
+
+
+class ParseContentTests(unittest.TestCase):
+    """Nothing that was meant to be our JSON envelope may reach the cursor
+    unparsed. Regression for history entry #160, where a reply cut off after
+    13 characters was pasted verbatim into the user's document."""
+
+    RAW = ("Okay, was steht jetzt als nächstes an? Jetzt steht der ganz rohe "
+           "Prototyp und ich habe ein Bild hochgeladen.")
+
+    def test_truncated_json_falls_back_to_the_raw_transcript(self):
+        result = Cleaner._parse_content('{\n  "cleaned_', self.RAW)
+        self.assertEqual(result.text, self.RAW)
+        self.assertEqual(result.new_terms, [])
+
+    def test_json_without_cleaned_text_falls_back(self):
+        result = Cleaner._parse_content('{"something_else": "hallo"}', self.RAW)
+        self.assertEqual(result.text, self.RAW)
+
+    def test_partial_json_naming_our_keys_falls_back(self):
+        result = Cleaner._parse_content('{"cleaned_text": "Okay, was ste',
+                                        self.RAW)
+        self.assertEqual(result.text, self.RAW)
+
+    def test_well_formed_json_is_used(self):
+        result = Cleaner._parse_content(
+            '{"cleaned_text": "Alles gut.", "new_terms": ["Prototyp"]}',
+            self.RAW,
+        )
+        self.assertEqual(result.text, "Alles gut.")
+        self.assertEqual(result.new_terms, ["Prototyp"])
+
+    def test_json_wrapped_in_a_code_fence_is_unwrapped(self):
+        result = Cleaner._parse_content(
+            '```json\n{"cleaned_text": "Alles gut.", "new_terms": []}\n```',
+            self.RAW,
+        )
+        self.assertEqual(result.text, "Alles gut.")
+
+    def test_prose_reply_is_still_accepted(self):
+        """A provider that ignores response_format returns a perfectly good
+        cleaned transcript as plain text."""
+        result = Cleaner._parse_content("Alles gut, der Prototyp steht.",
+                                        self.RAW)
+        self.assertEqual(result.text, "Alles gut, der Prototyp steht.")
+
+    def test_empty_reply_falls_back(self):
+        self.assertEqual(Cleaner._parse_content("   ", self.RAW).text, self.RAW)
+
 
 class StoreApiKeyTests(unittest.TestCase):
     def test_key_never_appears_in_the_command_line(self):
