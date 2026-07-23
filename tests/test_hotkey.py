@@ -86,7 +86,23 @@ class FnDispatchTests(unittest.TestCase):
         self.assertEqual(self.rec.starts, 1)
         self.assertEqual(self.rec.ends, 1)
 
-    def test_debounce_ignores_rapid_fire_events(self):
+    def test_debounce_ignores_duplicate_press_events(self):
+        from AppKit import NSEventModifierFlagFunction
+
+        class FakeEvent:
+            def __init__(self, flags):
+                self._flags = flags
+
+            def modifierFlags(self):
+                return self._flags
+
+        # Two press events in a row: the second changes nothing and is gated.
+        self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
+        self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
+        self.assertEqual(self.rec.starts, 1)
+        self.assertEqual(self.rec.ends, 0)
+
+    def test_debounce_ignores_duplicate_release_events(self):
         from AppKit import NSEventModifierFlagFunction
 
         class FakeEvent:
@@ -97,11 +113,8 @@ class FnDispatchTests(unittest.TestCase):
                 return self._flags
 
         self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
-        # Release within the debounce window — releases are never debounced,
-        # so this is delivered.
         self.listener._handle_event(FakeEvent(0))
-        # Another press within debounce of the release — still swallowed.
-        self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
+        self.listener._handle_event(FakeEvent(0))
         self.assertEqual(self.rec.starts, 1)
         self.assertEqual(self.rec.ends, 1)
 
@@ -121,7 +134,11 @@ class FnDispatchTests(unittest.TestCase):
         self.assertEqual(self.rec.starts, 1)
         self.assertEqual(self.rec.ends, 1)
 
-    def test_press_within_debounce_of_release_is_swallowed(self):
+    def test_press_within_debounce_of_release_still_starts_recording(self):
+        """Regression: gating on fn_down alone swallowed a genuine re-press
+        within 50 ms of a release. Because flagsChanged is edge-triggered, no
+        further event arrives while Fn stays held — the user spoke a whole
+        sentence with no recording and no error."""
         from AppKit import NSEventModifierFlagFunction
 
         class FakeEvent:
@@ -133,10 +150,31 @@ class FnDispatchTests(unittest.TestCase):
 
         self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
         self.listener._handle_event(FakeEvent(0))
-        # A press right after the release, still within DEBOUNCE_S, is gated.
+        # A press right after the release, still within DEBOUNCE_S.
         self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
-        self.assertEqual(self.rec.starts, 1)
+        self.assertEqual(self.rec.starts, 2)
         self.assertEqual(self.rec.ends, 1)
+        self.assertTrue(self.listener._held)
+
+        # ...and the matching release is delivered too.
+        self.listener._handle_event(FakeEvent(0))
+        self.assertEqual(self.rec.ends, 2)
+
+    def test_local_monitor_passes_the_event_through(self):
+        """A local monitor that returns None swallows the key inside our own
+        window; it must hand the event back to AppKit."""
+        from AppKit import NSEventModifierFlagFunction
+
+        class FakeEvent:
+            def __init__(self, flags):
+                self._flags = flags
+
+            def modifierFlags(self):
+                return self._flags
+
+        event = FakeEvent(NSEventModifierFlagFunction)
+        self.assertIs(self.listener._handle_local_event(event), event)
+        self.assertEqual(self.rec.starts, 1)
 
     def test_debounce_allows_event_after_timeout(self):
         from AppKit import NSEventModifierFlagFunction

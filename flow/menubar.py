@@ -347,11 +347,16 @@ class FlowApp(rumps.App):
         subprocess.run(["open", str(LOG_PATH)])
 
     def _install_emergency_quit(self):
-        """Global Cmd+Alt+Shift+Q force-exits without going through the menu.
+        """Cmd+Alt+Shift+Q force-exits without going through the menu.
 
-        This only helps while the app still responds: global monitors are
-        delivered on the main thread, so a wedged main loop never runs this
-        handler. Recovering from that case is MainLoopWatchdog's job.
+        This only helps while the app still responds: monitors are delivered
+        on the main thread, so a wedged main loop never runs this handler.
+        Recovering from that case is MainLoopWatchdog's job.
+
+        Both a global and a local monitor are registered. A global monitor
+        only sees events aimed at *other* apps, so on its own the shortcut
+        would be dead whenever Bomboclat Flow itself is frontmost — which is
+        precisely when a user reaches for it.
         """
         import logging as _logging
         import os as _os
@@ -379,16 +384,25 @@ class FlowApp(rumps.App):
             _log.warning("Emergency quit (Cmd+Alt+Shift+Q) — force-exiting")
             _os._exit(1)
 
-        self._emergency_monitor = (
+        def _handle_local(event):
+            _handle(event)
+            return event  # pass through, or we swallow keys in our own window
+
+        self._emergency_monitors = [
             NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
                 NSEventMaskKeyDown, _handle
-            )
-        )
+            ),
+            NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+                NSEventMaskKeyDown, _handle_local
+            ),
+        ]
         _log.info("Emergency quit handler installed (Cmd+Alt+Shift+Q)")
 
     def _quit(self, _item):
-        if hasattr(self, "_emergency_monitor") and self._emergency_monitor is not None:
-            from AppKit import NSEvent
-            NSEvent.removeMonitor_(self._emergency_monitor)
+        from AppKit import NSEvent
+
+        for monitor in getattr(self, "_emergency_monitors", []):
+            if monitor is not None:
+                NSEvent.removeMonitor_(monitor)
         self._notification_center.removeObserver_(self._open_observer)
         rumps.quit_application()
