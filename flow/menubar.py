@@ -18,7 +18,7 @@ from Foundation import NSDistributedNotificationCenter, NSObject
 from rumps import rumps as rumps_impl
 
 from . import config as config_mod
-from .cleanup import Cleaner, KEYCHAIN_SERVICE
+from .cleanup import Cleaner, store_api_key
 from .config import CONFIG_PATH, LOG_PATH, PROJECT_ROOT
 from .insert import accessibility_trusted
 from .lifecycle import (
@@ -245,11 +245,7 @@ class FlowApp(rumps.App):
         if not resp.clicked or not key:
             return
         try:
-            subprocess.run(
-                ["security", "add-generic-password", "-U",
-                 "-s", KEYCHAIN_SERVICE, "-a", provider, "-w", key],
-                check=True, capture_output=True, timeout=5,
-            )
+            store_api_key(provider, key)
         except Exception:
             log.exception("Storing API key in Keychain failed")
             rumps.alert("Could not store key", f"See log: {LOG_PATH}")

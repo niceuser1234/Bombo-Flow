@@ -127,6 +127,24 @@ def load_api_key(provider: str) -> str | None:
     return os.environ.get(env_var) or _keychain_key(account)
 
 
+def store_api_key(provider: str, key: str) -> None:
+    """Write an API key to the Keychain.
+
+    The key goes in over stdin rather than as `-w <key>`: process arguments
+    are readable by any other process on this Mac (ps, sysctl), so passing a
+    secret there would undo the point of using the Keychain. `security`
+    prompts for the value and then for a confirmation, hence twice.
+
+    Raises subprocess.CalledProcessError when the write fails.
+    """
+    subprocess.run(
+        ["security", "add-generic-password", "-U",
+         "-s", KEYCHAIN_SERVICE, "-a", provider, "-w"],
+        input=f"{key}\n{key}\n", text=True,
+        check=True, capture_output=True, timeout=5,
+    )
+
+
 class Cleaner:
     def __init__(self, cfg):
         self.cfg = cfg

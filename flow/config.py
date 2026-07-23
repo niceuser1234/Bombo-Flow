@@ -7,11 +7,15 @@ sys.frozen) the bundle is read-only, so the config lives in
 default on first launch.
 """
 
+import logging
 import shutil
 import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
+
+log = logging.getLogger(__name__)
 
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -47,6 +51,26 @@ class Config:
     sounds: bool = True
 
 
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+
+
+def checked_base_url(url: str, fallback: str) -> str:
+    """Reject a cleanup endpoint that would put the API key on the wire in
+    clear text. Plain HTTP to a local model server is fine — nothing leaves
+    the machine — so only non-local http:// falls back to the default."""
+    parsed = urlparse(str(url))
+    if parsed.scheme == "https":
+        return url
+    if parsed.scheme == "http" and parsed.hostname in _LOCAL_HOSTS:
+        return url
+    log.warning(
+        "Ignoring cleanup.base_url %r: the API key is sent as a bearer token "
+        "and %r would expose it. Falling back to %s",
+        url, parsed.scheme or "(no scheme)", fallback,
+    )
+    return fallback
+
+
 def load() -> Config:
     cfg = Config()
     if IS_FROZEN and not CONFIG_PATH.exists():
@@ -72,7 +96,9 @@ def load() -> Config:
     cfg.whisper_model = stt.get("whisper_model", cfg.whisper_model)
     cfg.cleanup_enabled = bool(cleanup.get("enabled", cfg.cleanup_enabled))
     cfg.cleanup_provider = cleanup.get("provider", cfg.cleanup_provider)
-    cfg.cleanup_base_url = cleanup.get("base_url", cfg.cleanup_base_url)
+    cfg.cleanup_base_url = checked_base_url(
+        cleanup.get("base_url", cfg.cleanup_base_url), cfg.cleanup_base_url
+    )
     cfg.cleanup_model = cleanup.get("model", cfg.cleanup_model)
     cfg.cleanup_min_words = int(cleanup.get("min_words", cfg.cleanup_min_words))
     cfg.cleanup_timeout_s = float(cleanup.get("timeout_s", cfg.cleanup_timeout_s))

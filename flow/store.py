@@ -28,6 +28,21 @@ AUTO_DICT_CAP = 400
 PROMOTE_AT = 1
 
 
+def _restrict_permissions(db_path) -> None:
+    """Make the store owner-only. It holds every transcript ever dictated, and
+    SQLite creates the database (and its -wal/-shm siblings) 0644 by default,
+    i.e. readable by any other account on the Mac."""
+    for path in (
+        db_path,
+        db_path.with_name(db_path.name + "-wal"),
+        db_path.with_name(db_path.name + "-shm"),
+    ):
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass  # not created yet, or not ours — best effort
+
+
 def _utcnow() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -47,6 +62,7 @@ class Store:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        _restrict_permissions(self.db_path)
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._init_schema()

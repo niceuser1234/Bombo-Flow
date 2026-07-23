@@ -364,14 +364,20 @@ class Pipeline:
             captured, initial_prompt=_build_initial_prompt(vocabulary)
         )
         t_stt = time.monotonic()
-        log.info("STT (%.2fs): %r", t_stt - released_at, raw)
+        # Transcripts only at DEBUG: the log file outlives the dictation and
+        # holds whatever the user happened to speak. INFO keeps the timings
+        # that make the log useful for diagnosing slowness.
+        log.info("STT (%.2fs): %d chars", t_stt - released_at, len(raw))
+        log.debug("STT raw: %r", raw)
         if not raw:
             return
         text, new_terms = raw, []
         if self.cleanup_enabled:
             result = self.cleaner.clean(raw, vocabulary=vocabulary)
             text, new_terms = result.text, result.new_terms
-            log.info("Cleaned (%.2fs): %r", time.monotonic() - t_stt, text)
+            log.info("Cleaned (%.2fs): %d chars",
+                     time.monotonic() - t_stt, len(text))
+            log.debug("Cleaned text: %r", text)
         app_name = _frontmost_app()
         # Persist before inserting. Insertion is the step that can fail for
         # reasons outside our control (wedged main thread, refused pasteboard),

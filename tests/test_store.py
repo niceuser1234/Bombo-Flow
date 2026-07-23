@@ -81,6 +81,20 @@ def test_dictionary_words_ordered_by_usage():
         assert store.dictionary_words() == ["Common", "Rare"]
 
 
+def test_database_is_not_world_readable():
+    """The store holds every transcript ever dictated. SQLite creates it 0644
+    by default, i.e. readable by any other account on this Mac."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "store.db"
+        store = Store(db_path=db_path)
+        store.add_word("Alpha")  # force a write so the WAL file exists
+
+        assert db_path.stat().st_mode & 0o077 == 0
+        wal = db_path.with_name(db_path.name + "-wal")
+        if wal.exists():
+            assert wal.stat().st_mode & 0o077 == 0
+
+
 def test_bump_uses_is_case_insensitive_and_ignores_empty():
     with tempfile.TemporaryDirectory() as tmp:
         store = Store(db_path=Path(tmp) / "store.db")

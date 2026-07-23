@@ -120,6 +120,27 @@ class AnthropicParseTests(unittest.TestCase):
         self.assertEqual(result.new_terms, [])
 
 
+class StoreApiKeyTests(unittest.TestCase):
+    def test_key_never_appears_in_the_command_line(self):
+        """Process arguments are readable by every other process on the Mac,
+        so a secret passed as `-w <key>` is exposed for the lifetime of the
+        call — which would defeat storing it in the Keychain at all."""
+        from unittest.mock import patch
+
+        import flow.cleanup as cleanup_mod
+
+        secret = "sk-super-secret-value"
+        with patch.object(cleanup_mod.subprocess, "run") as run:
+            cleanup_mod.store_api_key("anthropic", secret)
+
+        argv = run.call_args.args[0]
+        self.assertNotIn(secret, argv)
+        self.assertIn("-w", argv)
+        # security prompts for the value and then for a confirmation.
+        self.assertEqual(run.call_args.kwargs["input"], f"{secret}\n{secret}\n")
+        self.assertTrue(run.call_args.kwargs["check"])
+
+
 class ListFormattingPromptTests(unittest.TestCase):
     def test_system_prompt_instructs_list_formatting(self):
         from flow.cleanup import SYSTEM_PROMPT
