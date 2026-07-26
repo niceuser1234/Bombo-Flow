@@ -1,8 +1,8 @@
 # Bomboclat Flow
 
-A personal Wispr Flow clone for macOS: **hold Right-Option, speak, release** — polished text appears at your cursor in whatever app is focused.
+A personal Wispr Flow clone for macOS: **hold the Fn/🌐 key, speak, release** — polished text appears at your cursor in whatever app is focused. (Configurable under `[hotkey]` in `config.toml`: Right-Option, Right-Command, Right-Control and F13 also work.)
 
-- **Free to run**: speech-to-text happens locally on the M-series GPU (NVIDIA Parakeet via MLX, auto-detects German/English, <1 s per dictation)
+- **Free to run**: speech-to-text happens locally on the M-series GPU (Whisper large-v3-turbo via MLX, handles German/English mixed mid-sentence)
 - **Optional AI cleanup**: an LLM removes filler words and fixes punctuation — via OpenRouter (default: Gemini 2.5 Flash-Lite, ~$0.00006 per dictation) or the Anthropic API. Falls back to the raw transcript if offline.
 - **Recording overlay**: a floating waveform pill shows your voice level while you dictate
 - **App window** (menu → Open Bomboclat Flow):
@@ -104,8 +104,8 @@ Menu → **Start at login** installs a LaunchAgent pointing at whatever is curre
 ## Architecture
 
 ```
-hotkey.py (pynput, Right-Option) ─► audio.py (sounddevice, 16 kHz, RMS level)
-    ─► stt.py (parakeet-mlx on GPU)
+hotkey.py (pynput, Fn/🌐 by default) ─► audio.py (sounddevice, 16 kHz, RMS level)
+    ─► stt.py (mlx-whisper on GPU, parakeet-mlx optional)
     ─► cleanup.py (LLM: vocab-aware cleanup + new-term detection, optional)
     ─► insert.py (clipboard + Cmd+V, clipboard restored afterwards)
 
