@@ -60,5 +60,56 @@ class OverlayThreadSafeApiTests(unittest.TestCase):
         self.assertIsNone(ov._timer)
 
 
+class OverlayStyleTests(unittest.TestCase):
+    def test_dictation_layout_is_unchanged(self):
+        lay = overlay.layout_for("dictation")
+        self.assertEqual(lay["width"], overlay.PILL_WIDTH)
+        self.assertTrue(lay["show_wave"])
+        self.assertFalse(lay["show_lock"])
+        self.assertIsNone(lay["label"])
+
+    def test_handsfree_layout_shows_lock_and_wave(self):
+        lay = overlay.layout_for("handsfree")
+        self.assertTrue(lay["show_lock"] and lay["show_wave"])
+        self.assertGreater(lay["width"], overlay.PILL_WIDTH)
+
+    def test_command_layout_asks_the_question(self):
+        lay = overlay.layout_for("command")
+        self.assertEqual(lay["label"], "What should I do with it?")
+        self.assertTrue(lay["show_wave"])
+
+    def test_message_layout_has_no_wave(self):
+        lay = overlay.layout_for("message")
+        self.assertFalse(lay["show_wave"] or lay["show_lock"])
+
+    def test_handsfree_pill_is_green_not_blue(self):
+        r, g, b, _a = overlay.pill_colors("handsfree")[0]
+        self.assertTrue(g > r and g > b)
+
+    def test_unknown_style_falls_back_to_dictation(self):
+        self.assertEqual(overlay.layout_for("bogus"), overlay.layout_for("dictation"))
+
+    def test_positioned_frame_centres_a_wider_pill(self):
+        screen = NSMakeRect(0.0, 0.0, 1000.0, 800.0)
+        frame = overlay.positioned_pill_frame(screen, 330.0)
+        self.assertEqual(frame.size.width, 330.0)
+        self.assertEqual(frame.origin.x, 335.0)
+
+    def test_new_api_marshals_to_main_thread(self):
+        ov = overlay.Overlay(level_source=lambda: 0.0)
+        with patch("flow.overlay.AppHelper.callAfter") as call_after:
+            ov.show("handsfree")
+            ov.set_style("command")
+            ov.flash("hi", 1.0)
+        self.assertEqual(
+            [c.args for c in call_after.call_args_list],
+            [
+                (ov._show_main, "handsfree"),
+                (ov._set_style_main, "command"),
+                (ov._flash_main, "hi", 1.0),
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
