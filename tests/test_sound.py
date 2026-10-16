@@ -8,6 +8,7 @@ def _reset_cache():
     sound._loaded = False
     sound._start_sound = None
     sound._stop_sound = None
+    sound._handsfree_sound = None
 
 
 class SoundPlaybackTests(unittest.TestCase):
@@ -58,9 +59,19 @@ class SoundPlaybackTests(unittest.TestCase):
             sound.play_start()
             sound.play_start()
         self.assertEqual(
-            ns.alloc.return_value.initWithContentsOfFile_byReference_.call_count, 2
-        )  # one for start, one for stop asset — loaded once each, not per call
+            ns.alloc.return_value.initWithContentsOfFile_byReference_.call_count, 3
+        )  # one each for start, stop, hands-free asset — loaded once each, not per call
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_handsfree_chime_asset_exists_and_is_longer_than_start():
+    assert (sound._assets_dir() / "rec_handsfree.wav").exists()
+    assert sound.handsfree_duration_s() > sound.start_duration_s()
+
+
+def test_play_handsfree_never_raises(monkeypatch):
+    monkeypatch.setattr(sound, "_ensure_loaded", lambda: (_ for _ in ()).throw(RuntimeError("x")))
+    sound.play_handsfree()  # logged, not raised

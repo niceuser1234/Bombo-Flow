@@ -24,9 +24,11 @@ except Exception:
 
 _START_NAME = "rec_start.wav"
 _STOP_NAME = "rec_stop.wav"
+_HANDSFREE_NAME = "rec_handsfree.wav"
 
 _start_sound = None
 _stop_sound = None
+_handsfree_sound = None
 _loaded = False
 
 
@@ -46,13 +48,14 @@ def _load(name: str):
 
 
 def _ensure_loaded():
-    global _start_sound, _stop_sound, _loaded
+    global _start_sound, _stop_sound, _handsfree_sound, _loaded
     if _loaded:
         return
     _loaded = True
     _start_sound = _load(_START_NAME)
     _stop_sound = _load(_STOP_NAME)
-    if _start_sound is None or _stop_sound is None:
+    _handsfree_sound = _load(_HANDSFREE_NAME)
+    if _start_sound is None or _stop_sound is None or _handsfree_sound is None:
         log.warning("Recording sound asset(s) missing or failed to load")
 
 
@@ -97,3 +100,22 @@ def play_stop():
             _stop_sound.play()
     except Exception:
         log.exception("Failed to play stop sound")
+
+
+_handsfree_duration_s = None
+
+
+def handsfree_duration_s() -> float:
+    global _handsfree_duration_s
+    if _handsfree_duration_s is None:
+        _handsfree_duration_s = _wav_duration_s(_assets_dir() / _HANDSFREE_NAME)
+    return _handsfree_duration_s
+
+
+def play_handsfree():
+    try:
+        _ensure_loaded()
+        if _handsfree_sound is not None:
+            _handsfree_sound.play()
+    except Exception:
+        log.exception("Failed to play hands-free sound")

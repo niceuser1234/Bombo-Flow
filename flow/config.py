@@ -38,6 +38,7 @@ class Config:
     hotkey: str = "fn"
     min_duration_s: float = 0.3
     max_duration_s: float = 120.0
+    handsfree_max_s: float = 600.0
     # Microphone to record from (case-insensitive substring of the device
     # name). Empty = system default. See resolve_input_device in audio.py for
     # why pointing this at the built-in mic matters when wearing AirPods.
@@ -94,6 +95,7 @@ def load() -> Config:
     cfg.hotkey = hotkey.get("key", cfg.hotkey)
     cfg.min_duration_s = float(audio.get("min_duration_s", cfg.min_duration_s))
     cfg.max_duration_s = float(audio.get("max_duration_s", cfg.max_duration_s))
+    cfg.handsfree_max_s = float(audio.get("handsfree_max_s", cfg.handsfree_max_s))
     cfg.sounds = bool(audio.get("sounds", cfg.sounds))
     cfg.input_device = str(audio.get("input_device", cfg.input_device))
     cfg.engine = stt.get("engine", cfg.engine)

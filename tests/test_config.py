@@ -36,3 +36,18 @@ def test_missing_scheme_falls_back():
 
 def test_non_http_scheme_falls_back():
     assert checked_base_url("ftp://api.example.com/v1", DEFAULT) == DEFAULT
+
+
+def test_handsfree_max_default():
+    from flow.config import Config
+
+    assert Config().handsfree_max_s == 600.0
+
+
+def test_handsfree_max_loads_from_toml(tmp_path, monkeypatch):
+    import flow.config
+
+    path = tmp_path / "config.toml"
+    path.write_text("[audio]\nhandsfree_max_s = 90\n")
+    monkeypatch.setattr(flow.config, "CONFIG_PATH", path)
+    assert flow.config.load().handsfree_max_s == 90.0
