@@ -25,9 +25,11 @@ selection (generating new text), saved rewrite presets, engine changes
 | While hands-free: `handsfree_max_s` reached (default 600 s) | Force-stop and process, like today's max-duration path |
 
 A "tap" is a press whose release comes < `min_duration_s` (0.3 s) after the
-press. The first tap of a double tap is discarded exactly as today's taps are
-(it briefly opens the recorder; that is acceptable and keeps the hotkey path
-unchanged). Holding fn+Control never triggers hands-free.
+press. After a tap the recorder stays open for the 0.4 s double-tap window:
+a second press in that window turns the *same* stream into the hands-free
+recording (audio so far dropped); otherwise the tap is discarded as today.
+Keeping the stream open avoids a rapid stop/start of CoreAudio, which is what
+wedges it. Holding fn+Control never triggers hands-free.
 
 ### Feedback
 
@@ -90,8 +92,8 @@ The selected text is never deleted unless a complete rewrite is ready to paste.
 
 | Unit | Change |
 |---|---|
-| `flow/hotkey.py` `FnHotkeyListener` | Reads the Control flag on every flagsChanged event. Callbacks become `on_hold_start(mode)`, `on_hold_end()`, plus `on_mode_change(mode)` when Control is pressed mid-hold. Double-tap detection (tap release → next press within 0.4 s) emits mode `handsfree`. Pure timing/flag logic stays testable without AppKit. |
-| `flow/pipeline.py` | Recording carries a `mode` (`dictation` / `handsfree` / `command`). In `handsfree`, `on_hold_end` is ignored and the next `on_hold_start` stops the recording. On finish, `command` recordings go to the transform path instead of cleanup→paste. |
+| `flow/hotkey.py` `FnHotkeyListener` | Reads the Control flag on every flagsChanged event. Callbacks become `on_hold_start(mode)` with mode `dictation`/`command`, `on_hold_end()`, plus `on_mode_change("command")` when Control is pressed mid-hold. Pure flag logic stays testable without AppKit. |
+| `flow/pipeline.py` | Owns the double-tap state machine (tap → 0.4 s grace with the stream still open → second press switches to `handsfree`). Recording carries a `mode` (`dictation` / `handsfree` / `command`). In `handsfree`, `on_hold_end` is ignored and the next `on_hold_start` stops the recording. On finish, `command` recordings go to the transform path instead of cleanup→paste. |
 | `flow/transform.py` (new) | `grab_selection() -> str | None` (Cmd+C + pasteboard snapshot/restore, reusing `insert.py` helpers) and `build_rewrite_messages(text, instruction)`. |
 | `flow/cleanup.py` `Cleaner` | New `rewrite(text, instruction) -> str | None` reusing the provider plumbing (OpenRouter / Anthropic), plain-text reply, truncation → `None`. |
 | `flow/overlay.py` | `show(style)` with styles `dictation` / `handsfree` / `command`; `flash(message)` for short status messages ("Rewriting…", errors). |
