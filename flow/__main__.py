@@ -115,6 +115,7 @@ def main():
         cfg.hotkey,
         on_hold_start=pipeline.on_hold_start,
         on_hold_end=pipeline.on_hold_end,
+        on_mode_change=pipeline.on_mode_change,
     )
     listener.start()
 

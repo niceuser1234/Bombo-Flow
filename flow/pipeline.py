@@ -169,7 +169,10 @@ class Pipeline:
 
     # -- hotkey callbacks (run on the pynput listener thread) --
 
-    def on_hold_start(self):
+    def on_mode_change(self, mode):
+        pass  # filled in by the hands-free/rewrite task
+
+    def on_hold_start(self, mode="dictation"):
         with self._lock:
             if self.engine is None:
                 return
