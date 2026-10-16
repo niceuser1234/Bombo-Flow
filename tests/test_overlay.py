@@ -111,5 +111,43 @@ class OverlayStyleTests(unittest.TestCase):
         )
 
 
+class OverlayLivePillTests(unittest.TestCase):
+    def _live_overlay(self):
+        ov = overlay.Overlay(level_source=lambda: 0.0)
+        ov._window = Mock()
+        ov._window.isVisible.return_value = True
+        ov._pill, ov._wave, ov._label, ov._lock = Mock(), Mock(), Mock(), Mock()
+        ov._timer_target = Mock()
+        return ov
+
+    def test_set_style_on_visible_pill_sets_frame_via_animator(self):
+        ov = self._live_overlay()
+        with patch("flow.overlay.NSAnimationContext"):
+            ov._set_style_main("command")
+        ov._window.animator().setFrame_display_.assert_called_once()
+        width = ov._window.animator().setFrame_display_.call_args.args[0].size.width
+        self.assertEqual(width, overlay.WIDE_PILL_WIDTH)
+        ov._window.setFrame_display_.assert_not_called()
+
+    def test_flash_on_visible_pill_does_not_restart_pop_in(self):
+        ov = self._live_overlay()
+        with patch("flow.overlay.NSAnimationContext"), patch(
+            "flow.overlay.NSTimer"
+        ) as timer:
+            ov._flash_main("Rewriting...", 2.0)
+        ov._window.setAlphaValue_.assert_not_called()
+        ov._window.orderFrontRegardless.assert_not_called()
+        ov._label.setStringValue_.assert_called_with("Rewriting...")
+        self.assertEqual(ov._style, "message")
+        timer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_.assert_called_once()
+
+    def test_show_other_style_on_visible_pill_does_not_restart_pop_in(self):
+        ov = self._live_overlay()
+        with patch("flow.overlay.NSAnimationContext"):
+            ov._show_main("command")
+        ov._window.setAlphaValue_.assert_not_called()
+        self.assertEqual(ov._style, "command")
+
+
 if __name__ == "__main__":
     unittest.main()

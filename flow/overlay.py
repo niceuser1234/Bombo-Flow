@@ -78,6 +78,7 @@ def positioned_pill_frame(screen_frame, width=PILL_WIDTH):
 WIDE_PILL_WIDTH = 330.0
 HANDSFREE_PILL_WIDTH = 232.0
 LOCK_SLOT = 26.0
+STYLE_CHANGE_DURATION = 0.08
 PULSE_SPEED = 0.09  # radians per tick of the border pulse (~1 s period at 60 fps)
 
 _LAYOUTS = {
@@ -301,13 +302,13 @@ class Overlay:
         )
         wave = _WaveformView.alloc().initWithFrame_(wave_frame)
         wave.setWantsLayer_(True)
-        wave.setAutoresizingMask_(18)
+        wave.setAutoresizingMask_(0)  # laid out explicitly per style
         content.addSubview_(wave)
 
         label = NSTextField.labelWithString_("")
         label.setFont_(NSFont.systemFontOfSize_weight_(13.0, 0.3))
         label.setTextColor_(NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.92))
-        label.setAutoresizingMask_(18)
+        label.setAutoresizingMask_(0)
         label.setHidden_(True)
         content.addSubview_(label)
 
@@ -323,7 +324,7 @@ class Overlay:
         self._label = label
         self._lock = lock
 
-    def _position_window(self, width=None):
+    def _position_window(self, width=None, animated=False):
         if width is None:
             width = layout_for(self._style)["width"]
         mouse = NSEvent.mouseLocation()
@@ -334,9 +335,15 @@ class Overlay:
                 break
         if screen is None:
             screen = NSScreen.mainScreen()
-        self._window.setFrame_display_(
-            positioned_pill_frame(screen.frame(), width), False
-        )
+        frame = positioned_pill_frame(screen.frame(), width)
+        if animated:
+            # Through the animator so it supersedes an in-flight show animation.
+            NSAnimationContext.beginGrouping()
+            NSAnimationContext.currentContext().setDuration_(STYLE_CHANGE_DURATION)
+            self._window.animator().setFrame_display_(frame, True)
+            NSAnimationContext.endGrouping()
+        else:
+            self._window.setFrame_display_(frame, False)
 
     def _scaled_frame(self, frame, scale):
         scale = _clamp01(scale) if scale <= 1.0 else scale
@@ -357,7 +364,15 @@ class Overlay:
             self._position_window()
             self._window.orderOut_(None)
 
-    def _apply_style_main(self, style):
+    def _is_live(self):
+        """Window is on screen and not fading out."""
+        return (
+            self._window is not None
+            and self._window.isVisible()
+            and self._hide_timer is None
+        )
+
+    def _apply_style_main(self, style, animated=False):
         self._style = style
         lay = layout_for(style)
         w = lay["width"]
@@ -365,7 +380,7 @@ class Overlay:
         m = PILL_MARGIN
         self._pill.style = style
         self._pill.setNeedsDisplay_(True)
-        self._position_window(w)
+        self._position_window(w, animated)
 
         if lay["show_lock"]:
             self._lock.setFrame_(NSMakeRect(m + 2, (h - 18) / 2.0, 20, 18))
@@ -393,7 +408,7 @@ class Overlay:
 
     def _set_style_main(self, style):
         if self._window is not None and self._window.isVisible():
-            self._apply_style_main(style)
+            self._apply_style_main(style, animated=self._is_live())
 
     def _flash_main(self, message, seconds):
         self._show_main("message")
@@ -408,6 +423,10 @@ class Overlay:
     def _show_main(self, style="dictation"):
         self._prewarm_main()
         self._cancel_auto_hide()
+        if self._is_live():
+            # Already showing: restyle in place, no pop-in restart.
+            self._apply_style_main(style, animated=True)
+            return
         self._apply_style_main(style)
         if self._hide_timer is not None:
             self._hide_timer.invalidate()
