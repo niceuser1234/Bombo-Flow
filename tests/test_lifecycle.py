@@ -251,3 +251,40 @@ class MainLoopWatchdogTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# -- relaunch ---------------------------------------------------------------
+
+from unittest import mock  # noqa: E402
+
+from flow import lifecycle  # noqa: E402
+
+
+def test_relaunch_command_frozen_opens_the_bundle_in_background():
+    cmd = lifecycle.relaunch_command(
+        pid=4242,
+        executable="/Applications/Bomboclat Flow.app/Contents/MacOS/BomboclatFlow",
+        frozen=True,
+        project_root=Path("/unused"),
+    )
+    assert cmd[:3] == ["/bin/sh", "-c", lifecycle._WAIT_THEN_EXEC]
+    assert cmd[3] == "4242"
+    assert cmd[4:] == ["open", "/Applications/Bomboclat Flow.app", "--args", "--background"]
+
+
+def test_relaunch_command_dev_runs_the_module():
+    cmd = lifecycle.relaunch_command(
+        pid=7, executable="/x/.venv/bin/python", frozen=False, project_root=Path("/proj"),
+    )
+    assert cmd[3] == "7"
+    assert cmd[4:] == ["/x/.venv/bin/python", "-m", "flow", "--background"]
+
+
+def test_relaunch_spawns_helper_then_exits():
+    with mock.patch.object(lifecycle.subprocess, "Popen") as popen, \
+         mock.patch.object(lifecycle.os, "_exit") as exit_, \
+         mock.patch.object(lifecycle, "_dump_stacks"):
+        lifecycle.relaunch("test")
+    popen.assert_called_once()
+    assert popen.call_args.kwargs["start_new_session"] is True
+    exit_.assert_called_once_with(0)

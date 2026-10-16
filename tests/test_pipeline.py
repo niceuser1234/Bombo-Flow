@@ -57,6 +57,9 @@ class _Recorder:
     def abandon(self):
         self.abandoned += 1
 
+    def rescue(self):
+        return np.zeros(0, dtype=np.float32)
+
     @property
     def level(self):
         return 0.0
@@ -114,6 +117,9 @@ def _build_pipeline():
     pipeline._stopping = False
     pipeline._recover_timer = None
     pipeline._recovery_lock = threading.Lock()
+    pipeline._relaunch_pending = False
+    pipeline._relaunched = []
+    pipeline._relaunch = lambda reason: pipeline._relaunched.append(reason)
     return pipeline
 
 
@@ -259,18 +265,21 @@ class SoundHookTests(unittest.TestCase):
 
 
 class RecorderStopTimeoutTests(unittest.TestCase):
-    def test_safe_stop_returns_zeros_on_timeout(self):
+    def test_safe_stop_reports_timeout_with_rescued_audio(self):
         pipeline = _build_pipeline()
         pipeline.recorder._recording = True
         # Make stop hang by replacing with a deadlock.
         pipeline.recorder.stop = lambda: time.sleep(999) and np.zeros(0, dtype=np.float32)
-        result = pipeline._stop_recorder_safe()
-        self.assertEqual(len(result), 0)
+        pipeline.recorder.rescue = lambda: np.full(7, 0.1, dtype=np.float32)
+        result, timed_out = pipeline._stop_recorder_safe()
+        self.assertTrue(timed_out)
+        self.assertEqual(len(result), 7)
 
     def test_safe_stop_returns_audio_on_success(self):
         pipeline = _build_pipeline()
         pipeline.recorder._recording = True
-        result = pipeline._stop_recorder_safe()
+        result, timed_out = pipeline._stop_recorder_safe()
+        self.assertFalse(timed_out)
         self.assertEqual(len(result), 100)
         self.assertFalse(pipeline.recorder.recording)
         self.assertEqual(pipeline.recorder.stops, 1)
@@ -612,14 +621,15 @@ class AudioRecoveryTests(unittest.TestCase):
         self.assertIsNot(pipeline.recorder, old)
 
     def test_timed_out_capture_does_not_reset_portaudio_or_swap(self):
-        """An empty capture means _stop_recorder_safe already timed out and
-        swapped the recorder. _finish_recording must NOT reset PortAudio (would
-        tear down the still-live abandoned stream) nor swap the recorder again."""
+        """A timed-out stop means _stop_recorder_safe already swapped the
+        recorder. _finish_recording must NOT reset PortAudio (would tear down
+        the still-live abandoned stream) nor swap the recorder again; it asks
+        for a relaunch instead of showing an error."""
         pipeline = _build_pipeline()
         pipeline.recorder._recording = True
         pipeline._press_time = time.monotonic() - 1.0  # > min_duration_s
-        # _stop_recorder_safe returns zeros(0): the timeout path.
-        pipeline._stop_recorder_safe = lambda: np.zeros(0, dtype=np.float32)
+        # (audio, timed_out): the timeout path.
+        pipeline._stop_recorder_safe = lambda: (np.zeros(0, dtype=np.float32), True)
         swapped = pipeline.recorder
         with patch("flow.pipeline.audio_mod.reset_portaudio") as reset, \
                 patch("flow.pipeline.Recorder", _Recorder), \
@@ -627,6 +637,7 @@ class AudioRecoveryTests(unittest.TestCase):
             pipeline._finish_recording()
         reset.assert_not_called()
         self.assertIs(pipeline.recorder, swapped)
+        self.assertTrue(pipeline._relaunch_pending)
 
     def test_second_failure_cancels_the_previous_recovery_timer(self):
         """Two failures inside the 2s error window left the first timer
@@ -692,3 +703,76 @@ class PersistenceOrderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _HangingRecorder(_Recorder):
+    """start()/stop() block like a wedged CoreAudio HAL."""
+
+    def __init__(self, device_name=None, hang_start=False, hang_stop=False):
+        super().__init__(device_name)
+        self._gate = threading.Event()
+        self.hang_start = hang_start
+        self.hang_stop = hang_stop
+        self.chunks_audio = np.full(16000, 0.1, dtype=np.float32)
+
+    def start(self):
+        if self.hang_start:
+            self._gate.wait(10)
+        super().start()
+
+    def stop(self):
+        if self.hang_stop:
+            self._gate.wait(10)
+        return super().stop()
+
+    def rescue(self):
+        return self.chunks_audio
+
+
+class FreezeRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.p = _build_pipeline()
+        self.p.engine = object()
+        self.queued = []
+        self.p._queue = type("_Q", (), {"put": lambda s, item: self.queued.append(item)})()
+
+    def test_hanging_start_returns_and_requests_relaunch(self):
+        self.p.recorder = _HangingRecorder(hang_start=True)
+        with patch("flow.pipeline.START_TIMEOUT_S", 0.05), patch("flow.pipeline.sound"):
+            t0 = time.monotonic()
+            self.p.on_hold_start()
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertTrue(self.p._relaunch_pending)
+        self.assertEqual(self.queued, [None])  # sentinel only — nothing to rescue
+
+    def test_hanging_stop_rescues_audio_then_relaunches(self):
+        self.p.recorder = _HangingRecorder(hang_stop=True)
+        self.p.recorder._recording = True
+        self.p._press_time = time.monotonic() - 2.0  # a real 2 s dictation
+        with patch("flow.pipeline.STOP_TIMEOUT_S", 0.05), patch("flow.pipeline.sound"):
+            self.p._finish_recording()
+        self.assertEqual(len(self.queued), 2)
+        captured, _released_at, mode = self.queued[0]
+        self.assertEqual(len(captured), 16000)
+        self.assertEqual(mode, "dictation")
+        self.assertIsNone(self.queued[1])
+        self.assertTrue(self.p._relaunch_pending)
+
+    def test_presses_are_ignored_once_relaunch_is_pending(self):
+        self.p._relaunch_pending = True
+        self.p.on_hold_start()
+        self.assertFalse(self.p.recorder.recording)
+
+    def test_relaunch_waits_for_queued_dictation(self):
+        import queue as queue_mod
+
+        p = _build_pipeline()
+        p._queue = queue_mod.Queue()
+        order = []
+        p._process = lambda captured, released_at, mode="dictation": order.append("processed")
+        p._relaunch = lambda reason: order.append("relaunch")
+        p._load_model = lambda: True
+        p._queue.put((np.zeros(10, dtype=np.float32), 0.0, "dictation"))
+        p._queue.put(None)
+        p._worker()  # returns after the sentinel
+        self.assertEqual(order, ["processed", "relaunch"])

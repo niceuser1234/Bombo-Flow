@@ -13,6 +13,7 @@ import threading
 import time
 
 from . import audio as audio_mod
+from . import lifecycle
 from . import sound
 from . import stt
 from .audio import Recorder
@@ -27,6 +28,7 @@ log = logging.getLogger(__name__)
 # States: loading, idle, recording, processing, error
 
 STOP_TIMEOUT_S = 2.0  # max seconds to wait for recorder.stop() before giving up.
+START_TIMEOUT_S = 2.0  # max seconds to wait for recorder.start() before giving up.
 # Added to the chime's own length when muting the capture: the sound travels
 # from the speakers back to the microphone, and playback starts a moment after
 # play() returns.
@@ -126,6 +128,10 @@ class Pipeline:
         # Held for the duration of an audio recovery. Acquired non-blocking,
         # so it doubles as the "recovery in progress" flag for on_hold_start.
         self._recovery_lock = threading.Lock()
+        # Set once CoreAudio has wedged: no new recordings, and the worker
+        # relaunches the app after finishing whatever is still queued.
+        self._relaunch_pending = False
+        self._relaunch = lifecycle.relaunch
 
     def _new_recorder(self) -> Recorder:
         """Every Recorder — the initial one and each replacement built during
@@ -167,6 +173,9 @@ class Pipeline:
         with self._lock:
             if self.engine is None:
                 return
+            if self._relaunch_pending:
+                log.debug("on_hold_start skipped: relaunch pending")
+                return
             if self.recorder.recording:
                 log.debug("on_hold_start skipped: already recording")
                 return
@@ -179,11 +188,20 @@ class Pipeline:
                 log.debug("on_hold_start skipped: audio recovery in progress")
                 return
             self._press_time = time.monotonic()
-            try:
-                self.recorder.start()
-            except Exception:
-                log.exception(
-                    "Could not start recording — resetting audio stack"
+            finished, _, error = self._run_bounded(
+                self.recorder.start, START_TIMEOUT_S, "recorder-start"
+            )
+            if not finished:
+                log.warning(
+                    "recorder.start() did not return within %.1fs — CoreAudio "
+                    "is wedged", START_TIMEOUT_S,
+                )
+                self._request_relaunch("recorder.start() hung")
+                return
+            if error is not None:
+                log.error(
+                    "Could not start recording — resetting audio stack",
+                    exc_info=error,
                 )
                 self._schedule_recovery()
                 return
@@ -230,26 +248,24 @@ class Pipeline:
         # re-press cannot start a recording whose state/overlay this old
         # press would then stomp. The blocking stop still runs lock-free.
         try:
-            captured = self._stop_recorder_safe()
+            captured, timed_out = self._stop_recorder_safe()
             if self.cfg.sounds:
                 sound.play_stop()
 
             self.overlay.hide()
+            if timed_out:
+                if (duration >= self.cfg.min_duration_s and len(captured)
+                        and not audio_mod.is_silent(captured)):
+                    self.set_state("processing")
+                    self._queue.put((captured, time.monotonic(), "dictation"))
+                self._request_relaunch("recorder.stop() hung")
+                return
             if duration < self.cfg.min_duration_s:
                 log.info("Discarding %.2fs tap", duration)
                 self.set_state("idle")
                 return
             if len(captured) == 0:
-                # Empty capture means _stop_recorder_safe timed out and has
-                # ALREADY abandoned the wedged stream and swapped in a fresh
-                # Recorder. Do NOT reset PortAudio here: sd._terminate() while
-                # the abandoned CoreAudio stream is still live in the wedged
-                # HAL thread can crash. Just surface the error and recover UI.
-                log.warning(
-                    "recorder.stop() timed out — recorder already rebuilt; "
-                    "skipping PortAudio reset to avoid tearing down the "
-                    "abandoned stream"
-                )
+                log.warning("recorder.stop() returned no audio")
                 self._enter_error_then_idle()
                 return
             if audio_mod.is_silent(captured):
@@ -261,7 +277,7 @@ class Pipeline:
                 self._schedule_recovery()
                 return
             self.set_state("processing")
-            self._queue.put((captured, time.monotonic()))
+            self._queue.put((captured, time.monotonic(), "dictation"))
         finally:
             with self._lock:
                 self._stopping = False
@@ -324,47 +340,65 @@ class Pipeline:
         self._recover_timer.daemon = True
         self._recover_timer.start()
 
-    def _stop_recorder_safe(self) -> "np.ndarray":
-        """Stop the recorder off the calling thread, with a hard timeout.
-
-        CoreAudio can wedge inside AudioDeviceStop (its IO thread and the
-        stopping thread deadlock over the HAL locks). The stop therefore runs
-        on a throwaway thread: if it does not return in time we abandon that
-        thread along with its stream and swap in a fresh Recorder, so the next
-        dictation still works instead of finding `recording` stuck at True.
-
-        Returns the captured audio array, or zeros when the stop timed out.
-        """
-        import numpy as np
-
-        result: list[np.ndarray] = []
+    def _run_bounded(self, func, timeout, name):
+        """Run func() on a throwaway thread. Returns (finished, result, error).
+        A wedged CoreAudio call leaves its thread behind — daemon, harmless."""
+        box: dict = {}
         done = threading.Event()
-        stuck = self.recorder
 
-        def _stop():
+        def _run():
             try:
-                result.append(stuck.stop())
-            except Exception:
-                log.exception("recorder.stop() raised")
+                box["result"] = func()
+            except BaseException as e:  # re-raised by the caller
+                box["error"] = e
             finally:
                 done.set()
 
-        stopper = threading.Thread(target=_stop, daemon=True, name="recorder-stop")
-        stopper.start()
-        if not done.wait(STOP_TIMEOUT_S):
+        threading.Thread(target=_run, daemon=True, name=name).start()
+        if not done.wait(timeout):
+            return False, None, None
+        return True, box.get("result"), box.get("error")
+
+    def _stop_recorder_safe(self) -> "tuple[np.ndarray, bool]":
+        """Stop the recorder off the calling thread, with a hard timeout.
+
+        CoreAudio can wedge inside AudioDeviceStop (its IO thread and the
+        stopping thread deadlock over the HAL locks). On timeout the audio
+        captured so far is rescued, the stream abandoned, and a fresh
+        Recorder swapped in. Returns (audio, timed_out).
+        """
+        import numpy as np
+
+        stuck = self.recorder
+        finished, result, error = self._run_bounded(
+            stuck.stop, STOP_TIMEOUT_S, "recorder-stop"
+        )
+        if not finished:
             log.warning(
                 "recorder.stop() did not return within %.1fs — CoreAudio is "
-                "stalled; abandoning the stream and rebuilding the recorder",
+                "stalled; rescuing the captured audio and abandoning the stream",
                 STOP_TIMEOUT_S,
             )
+            rescued = stuck.rescue()
             stuck.abandon()
             # The overlay's level_source closes over `self`, so it follows the
             # swap without further wiring.
             self.recorder = self._new_recorder()
-            return np.zeros(0, dtype=np.float32)
-        if result:
-            return result[0]
-        return np.zeros(0, dtype=np.float32)
+            return rescued, True
+        if error is not None:
+            log.error("recorder.stop() raised", exc_info=error)
+            return np.zeros(0, dtype=np.float32), False
+        return result, False
+
+    def _request_relaunch(self, reason: str):
+        """CoreAudio is wedged for the rest of this process. Stop taking new
+        recordings; the worker relaunches once the queue ahead is drained."""
+        if self._relaunch_pending:
+            return
+        self._relaunch_pending = True
+        self.set_state("loading")
+        self._queue.put(None)
+        log.warning("Relaunch scheduled: %s", reason)
 
     # -- worker --
 
@@ -372,9 +406,13 @@ class Pipeline:
         if not self._load_model():
             return
         while True:
-            captured, released_at = self._queue.get()
+            item = self._queue.get()
+            if item is None:
+                self._relaunch("CoreAudio wedged")
+                return
+            captured, released_at, mode = item
             try:
-                self._process(captured, released_at)
+                self._process(captured, released_at, mode)
             except Exception:
                 log.exception("Pipeline processing failed")
                 self.set_state("error")
@@ -383,7 +421,7 @@ class Pipeline:
                 if self._queue.empty() and not self.recorder.recording:
                     self.set_state("idle")
 
-    def _process(self, captured, released_at):
+    def _process(self, captured, released_at, mode="dictation"):
         store = get_store()
         # Two lists on purpose: the cleanup LLM sees the whole dictionary (it
         # has the surrounding text and is told not to insert unspoken terms),

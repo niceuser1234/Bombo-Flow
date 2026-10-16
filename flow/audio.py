@@ -164,6 +164,16 @@ class Recorder:
         self._chunks = []
         return audio
 
+    def rescue(self) -> np.ndarray:
+        """Audio captured so far, for a stream whose stop() wedged.
+
+        Copies the chunk list first: the CoreAudio callback may still append
+        to it from its own thread until abandon() flips _discard."""
+        chunks = list(self._chunks)
+        if not chunks:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(chunks)[:, 0]
+
     def abandon(self):
         """Give up on a wedged stream: stop feeding the callback and close
         the CoreAudio stream in the background, without blocking or ever
