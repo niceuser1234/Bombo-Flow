@@ -237,7 +237,8 @@ class Cleaner:
             return CleanResult(text, [])
         # A long hands-free dictation outgrows the fixed limits: the reply
         # would be cut off (and the raw transcript pasted) or time out.
-        # Up to ~120 words / ~800 words these stay at their old values.
+        # Short dictations keep the old values: the timeout (with the 5 s
+        # default) up to ~120 words, max_tokens up to ~820 words.
         timeout = max(self.cfg.cleanup_timeout_s, 3.0 + words / 60.0)
         max_tokens = min(8192, max(2048, int(words * 2.5)))
         try:
