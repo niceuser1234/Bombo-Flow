@@ -30,6 +30,7 @@ log = logging.getLogger(__name__)
 
 STOP_TIMEOUT_S = 2.0  # max seconds to wait for recorder.stop() before giving up.
 START_TIMEOUT_S = 2.0  # max seconds to wait for recorder.start() before giving up.
+RESET_TIMEOUT_S = 3.0  # max seconds to wait for reset_portaudio() before giving up.
 # Added to the chime's own length when muting the capture: the sound travels
 # from the speakers back to the microphone, and playback starts a moment after
 # play() returns.
@@ -362,6 +363,14 @@ class Pipeline:
                     self._queue.put((captured, time.monotonic(), mode))
                 self._request_relaunch("recorder.stop() hung")
                 return
+            if self._relaunch_pending:
+                # E.g. a start that returned after its timeout already asked
+                # for the relaunch. Anything queued now would sit behind the
+                # relaunch sentinel, and a recovery would race it. The state
+                # stays "loading" until the app restarts.
+                self.overlay.hide()
+                log.info("Discarding recording: relaunch pending")
+                return
             if discard or duration < self.cfg.min_duration_s:
                 self.overlay.hide()
                 log.info("Discarding %.2fs tap", duration)
@@ -402,6 +411,11 @@ class Pipeline:
         inline would stall every further press and release behind it — the
         app would stop responding to the hotkey altogether.
         """
+        if self._relaunch_pending:
+            # A relaunch replaces the whole audio stack anyway; touching
+            # PortAudio now would only race the wedged stream.
+            log.debug("Audio recovery skipped: relaunch pending")
+            return
         if not self._recovery_lock.acquire(blocking=False):
             log.debug("Audio recovery already in progress")
             return
@@ -432,7 +446,20 @@ class Pipeline:
             )
             stale.abandon()
         else:
-            audio_mod.reset_portaudio()
+            # Bounded like start/stop: a blocked Pa_Terminate would otherwise
+            # hold _recovery_lock forever, refusing every later press.
+            finished, _, error = self._run_bounded(
+                audio_mod.reset_portaudio, RESET_TIMEOUT_S, "portaudio-reset"
+            )
+            if not finished:
+                log.warning(
+                    "reset_portaudio() did not return within %.1fs — "
+                    "CoreAudio is wedged", RESET_TIMEOUT_S,
+                )
+                self._request_relaunch("reset_portaudio() hung")
+                return
+            if error is not None:
+                raise error
         self.recorder = self._new_recorder()
         self._enter_error_then_idle()
 

@@ -792,6 +792,55 @@ class FreezeRecoveryTests(unittest.TestCase):
         p._worker()  # returns after the sentinel
         self.assertEqual(order, ["processed", "relaunch"])
 
+    def test_hanging_portaudio_reset_requests_relaunch_and_frees_recovery(self):
+        """Pa_Terminate blocks in exactly the wedged state recovery exists
+        for. Unbounded, the recovery lock was never released and every later
+        press was refused without a relaunch."""
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        with patch("flow.pipeline.RESET_TIMEOUT_S", 0.05), \
+                patch("flow.pipeline.audio_mod.reset_portaudio",
+                      side_effect=lambda: gate.wait(5)), \
+                patch("flow.pipeline.Recorder", _Recorder):
+            self.p._schedule_recovery()
+            _wait_for_recovery(self.p)
+        self.assertTrue(self.p._relaunch_pending)
+        self.assertEqual(self.queued, [None])
+        self.assertFalse(self.p._recovery_lock.locked())
+
+    def test_recovery_is_not_started_once_relaunch_is_pending(self):
+        self.p._relaunch_pending = True
+        with patch("flow.pipeline.audio_mod.reset_portaudio") as reset:
+            self.p._schedule_recovery()
+            _wait_for_recovery(self.p)
+        reset.assert_not_called()
+
+    def test_finish_while_relaunch_pending_queues_nothing(self):
+        """A start that returned late (after its timeout requested the
+        relaunch) leaves a live recording behind. It must not be queued
+        behind the relaunch sentinel."""
+        self.p._relaunch_pending = True
+        self.p.recorder._recording = True
+        self.p._press_time = time.monotonic() - 2.0
+        with patch("flow.pipeline.audio_mod.is_silent", return_value=False), \
+                patch("flow.pipeline.sound"):
+            self.p._finish_recording()
+        self.assertFalse(self.p.recorder.recording)
+        self.assertEqual(self.queued, [])
+
+    def test_silent_finish_while_relaunch_pending_skips_recovery(self):
+        self.p._relaunch_pending = True
+        self.p.recorder._recording = True
+        self.p._press_time = time.monotonic() - 2.0
+        with patch("flow.pipeline.audio_mod.is_silent", return_value=True), \
+                patch("flow.pipeline.audio_mod.reset_portaudio") as reset, \
+                patch.object(self.p, "_schedule_recovery") as schedule, \
+                patch("flow.pipeline.sound"):
+            self.p._finish_recording()
+        schedule.assert_not_called()
+        reset.assert_not_called()
+        self.assertEqual(self.queued, [])
+
 
 class HandsFreeTests(unittest.TestCase):
     def setUp(self):
