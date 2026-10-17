@@ -1115,6 +1115,27 @@ class RewritePathTests(unittest.TestCase):
         self.grab.assert_not_called()
         self.assertIn(("Rewrite needs an API key", 2.0), self.p.overlay.flashes)
 
+    def test_newer_recording_keeps_the_overlay_on_success(self):
+        """A press while the rewrite runs owns the overlay; hiding it would
+        blank that recording's pill."""
+        self.p.recorder._recording = True
+        self.p.overlay.hide = mock.Mock()
+        self._run()
+        self.p.overlay.hide.assert_not_called()
+        self.insert.assert_called_once_with("- a\n- b", mode="paste")
+
+    def test_newer_recording_keeps_the_overlay_on_failure(self):
+        self.p.recorder._recording = True
+        self.grab.return_value = None
+        self._run()
+        self.assertEqual(self.p.overlay.flashes, [])
+
+    def test_newer_recording_keeps_the_overlay_when_rewrite_raises(self):
+        self.p.recorder._recording = True
+        self.grab.side_effect = RuntimeError("boom")
+        self._run()
+        self.assertEqual(self.p.overlay.flashes, [])
+
     def test_dictation_mode_still_uses_cleanup_path(self):
         self.p._process(np.zeros(16000, dtype=np.float32), time.monotonic(), "dictation")
         self.p.cleaner.rewrite.assert_not_called()

@@ -596,27 +596,37 @@ class Pipeline:
             self._rewrite(captured, released_at)
         except Exception:
             log.exception("Rewrite failed")
-            self.overlay.flash("Rewrite failed", 2.0)
+            self._rewrite_feedback("Rewrite failed")
+
+    def _rewrite_feedback(self, message=None):
+        """Replace the "Rewriting…" pill with a message, or hide it. A
+        recording started meanwhile owns the overlay, so leave it alone."""
+        if self.recorder.recording:
+            return
+        if message is None:
+            self.overlay.hide()
+        else:
+            self.overlay.flash(message, 2.0)
 
     def _rewrite(self, captured, released_at):
         instruction = self.engine.transcribe(captured).strip()
         log.info("Rewrite instruction (%.2fs): %d chars",
                  time.monotonic() - released_at, len(instruction))
         if len(instruction) < 2:
-            self.overlay.flash("Didn't catch that", 2.0)
+            self._rewrite_feedback("Didn't catch that")
             return
         if not self.cleaner.available:
-            self.overlay.flash("Rewrite needs an API key", 2.0)
+            self._rewrite_feedback("Rewrite needs an API key")
             return
         selection = transform.grab_selection()
         if not selection:
-            self.overlay.flash("Select some text first", 2.0)
+            self._rewrite_feedback("Select some text first")
             return
         result = self.cleaner.rewrite(selection, instruction)
         if not result:
-            self.overlay.flash("Rewrite failed", 2.0)
+            self._rewrite_feedback("Rewrite failed")
             return
-        self.overlay.hide()
+        self._rewrite_feedback()
         try:
             get_store().add_dictation(
                 instruction, result,
