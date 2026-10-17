@@ -18,12 +18,20 @@ from flow.pipeline import (
 class _Overlay:
     def __init__(self):
         self.prewarmed = False
+        self.styles = []
+        self.flashes = []
 
     def prewarm(self):
         self.prewarmed = True
 
-    def show(self):
-        pass
+    def show(self, style="dictation"):
+        self.styles.append(style)
+
+    def set_style(self, style):
+        self.styles.append(style)
+
+    def flash(self, message, seconds=2.0):
+        self.flashes.append(message)
 
     def hide(self):
         pass
@@ -35,6 +43,7 @@ class _Recorder:
     def __init__(self, device_name=None):
         self._recording = False
         self.stops = 0
+        self.clears = 0
         self.abandoned = 0
         self.muted_for = None
         self.device_name = device_name
@@ -53,6 +62,9 @@ class _Recorder:
         self.stops += 1
         self._recording = False
         return np.zeros(100, dtype=np.float32)
+
+    def clear(self):
+        self.clears += 1
 
     def abandon(self):
         self.abandoned += 1
@@ -79,6 +91,7 @@ class _Config:
     cleanup_min_words = 4
     insert_mode = "paste"
     sounds = True
+    handsfree_max_s = 600.0
 
 
 class _FakeStore:
@@ -118,6 +131,8 @@ def _build_pipeline():
     pipeline._recover_timer = None
     pipeline._recovery_lock = threading.Lock()
     pipeline._relaunch_pending = False
+    pipeline._mode = None
+    pipeline._tap_timer = None
     pipeline._relaunched = []
     pipeline._relaunch = lambda reason: pipeline._relaunched.append(reason)
     return pipeline
@@ -776,3 +791,173 @@ class FreezeRecoveryTests(unittest.TestCase):
         p._queue.put(None)
         p._worker()  # returns after the sentinel
         self.assertEqual(order, ["processed", "relaunch"])
+
+
+class HandsFreeTests(unittest.TestCase):
+    def setUp(self):
+        self.p = _build_pipeline()
+        self.p.engine = object()
+        self.states = []
+        self.p.set_state = self.states.append
+        self.queued = []
+        self.p._queue = type("_Q", (), {"put": lambda s, item: self.queued.append(item)})()
+        self.sound = patch("flow.pipeline.sound").start()
+        self.sound.start_duration_s.return_value = 0.2
+        self.sound.handsfree_duration_s.return_value = 0.3
+        # The fake recorder returns zeros, which the silence check would send
+        # down the recovery path instead of the queue.
+        patch("flow.pipeline.audio_mod.is_silent", return_value=False).start()
+        self.addCleanup(patch.stopall)
+        self.addCleanup(self._cancel_timers)
+
+    def _cancel_timers(self):
+        for timer in (self.p._tap_timer, self.p._max_timer):
+            if timer is not None and hasattr(timer, "cancel"):
+                timer.cancel()
+
+    def _tap(self):
+        self.p.on_hold_start("dictation")
+        self.p._press_time = time.monotonic() - 0.1  # a 0.1 s tap
+        self.p.on_hold_end()
+
+    def test_double_tap_enters_handsfree_on_same_stream(self):
+        self._tap()
+        self.p.on_hold_start("dictation")
+        self.assertEqual(self.p._mode, "handsfree")
+        self.assertEqual(self.p.recorder.stops, 0)  # stream never restarted
+        self.assertEqual(self.p.recorder.clears, 1)
+        self.assertIn("handsfree", self.states)
+        self.sound.play_handsfree.assert_called_once()
+
+    def test_release_is_ignored_in_handsfree(self):
+        self._tap()
+        self.p.on_hold_start("dictation")
+        self.p.on_hold_end()
+        self.assertTrue(self.p.recorder.recording)
+
+    def test_next_press_stops_handsfree_and_queues_it(self):
+        self._tap()
+        self.p.on_hold_start("dictation")
+        self.p._press_time = time.monotonic() - 5.0
+        self.p.on_hold_start("dictation")
+        self.assertFalse(self.p.recorder.recording)
+        self.assertEqual(self.queued[-1][2], "handsfree")
+
+    def test_single_tap_is_discarded_after_grace(self):
+        with patch("flow.pipeline.DOUBLE_TAP_S", 0.05):
+            self._tap()
+            self.assertTrue(self.p.recorder.recording)  # grace window open
+            time.sleep(0.2)
+        self.assertFalse(self.p.recorder.recording)
+        self.assertEqual(self.queued, [])
+
+    def test_long_hold_is_a_normal_dictation(self):
+        self.p.on_hold_start("dictation")
+        self.p._press_time = time.monotonic() - 2.0
+        self.p.on_hold_end()
+        self.assertEqual(self.queued[-1][2], "dictation")
+        self.assertIsNone(self.p._tap_timer)
+
+    def test_handsfree_uses_its_own_max_duration(self):
+        self._tap()
+        with patch("flow.pipeline.threading.Timer") as timer:
+            self.p.on_hold_start("dictation")
+        self.assertEqual(timer.call_args.args[0], 600.0)
+
+    def test_mode_change_turns_dictation_into_command(self):
+        self.p.on_hold_start("dictation")
+        self.p.on_mode_change("command")
+        self.assertEqual(self.p._mode, "command")
+        self.assertEqual(self.p.overlay.styles[-1], "command")
+
+    def test_mode_change_ignored_in_handsfree(self):
+        self._tap()
+        self.p.on_hold_start("dictation")
+        self.p.on_mode_change("command")
+        self.assertEqual(self.p._mode, "handsfree")
+
+    def test_command_press_never_enters_handsfree(self):
+        self._tap()
+        self.p.on_hold_start("command")  # Control held on the second press
+        self.assertNotEqual(self.p._mode, "handsfree")
+
+    # -- additions beyond the brief --
+
+    def test_command_press_in_grace_discards_tap_then_records_command(self):
+        self._tap()
+        self.p.on_hold_start("command")
+        self.assertEqual(self.p._mode, "command")
+        self.assertIsNone(self.p._tap_timer)
+        self.assertTrue(self.p.recorder.recording)
+        self.assertEqual(self.p.recorder.stops, 1)  # the tap's stream
+        self.assertEqual(self.queued, [])
+        self.assertEqual(self.p.overlay.styles[-1], "command")
+
+    def test_command_recording_is_queued_as_command(self):
+        self.p.on_hold_start("dictation")
+        self.p.on_mode_change("command")
+        self.p._press_time = time.monotonic() - 2.0
+        self.p.on_hold_end()
+        self.assertIsNone(self.p._tap_timer)
+        self.assertEqual(self.queued[-1][2], "command")
+        self.assertIsNone(self.p._mode)
+
+    def test_handsfree_restarts_the_max_timer(self):
+        self._tap()
+        old = self.p._max_timer
+        self.p.on_hold_start("dictation")
+        self.assertIsNot(self.p._max_timer, old)
+        self.assertFalse(old.is_alive() and not old.finished.is_set())
+        self.assertEqual(self.p._max_timer.interval, 600.0)
+
+    def test_discard_queues_nothing_and_goes_idle(self):
+        self._tap()
+        self.p._finish_recording(discard=True)
+        self.assertFalse(self.p.recorder.recording)
+        self.assertEqual(self.queued, [])
+        self.assertEqual(self.states[-1], "idle")
+        self.sound.play_stop.assert_called_once()
+        self.assertIsNone(self.p._mode)
+        self.assertIsNone(self.p._tap_timer)
+
+    def test_superseded_grace_timer_cannot_discard_handsfree(self):
+        """The grace timer can fire just as the second press switches to
+        hands-free and then wait on the lock; it must not drop the new
+        hands-free recording once it gets in."""
+        self._tap()
+        stale = self.p._tap_timer
+        self.p.on_hold_start("dictation")  # hands-free; cancels `stale`
+        self.p._finish_recording(discard=True, tap=stale)
+        self.assertTrue(self.p.recorder.recording)
+        self.assertEqual(self.p._mode, "handsfree")
+
+    def test_short_press_without_mode_finishes_immediately(self):
+        """Recordings not started through on_hold_start (no mode) keep the
+        old release-to-finish behaviour."""
+        self.p.recorder._recording = True
+        self.p._press_time = time.monotonic() - 0.1
+        self.p.on_hold_end()
+        self.assertFalse(self.p.recorder.recording)
+        self.assertIsNone(self.p._tap_timer)
+
+    def test_force_stop_finishes_handsfree(self):
+        self._tap()
+        self.p.on_hold_start("dictation")
+        self.p._press_time = time.monotonic() - 10.0
+        self.p._force_stop()
+        self.assertFalse(self.p.recorder.recording)
+        self.assertEqual(self.queued[-1][2], "handsfree")
+
+    def test_timed_out_stop_in_handsfree_queues_handsfree(self):
+        rec = _HangingRecorder(hang_stop=True)
+        self.p.recorder = rec
+        self._tap()
+        self.p.on_hold_start("dictation")
+        self.p._press_time = time.monotonic() - 3.0
+        with patch("flow.pipeline.STOP_TIMEOUT_S", 0.05), \
+                patch("flow.pipeline.Recorder", _Recorder):
+            self.p.on_hold_start("dictation")
+        rec._gate.set()
+        self.assertEqual(self.queued[0][2], "handsfree")
+        self.assertIsNone(self.queued[1])
+        self.assertTrue(self.p._relaunch_pending)

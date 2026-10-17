@@ -138,6 +138,10 @@ class Recorder:
         if seconds > 0:
             self._muted_until = time.monotonic() + seconds
 
+    def clear(self):
+        """Drop what was captured so far (the double tap's first press)."""
+        self._chunks = []
+
     def _callback(self, indata, frames, time_info, status):
         if self._discard:
             return

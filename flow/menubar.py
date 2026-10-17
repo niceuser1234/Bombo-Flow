@@ -41,6 +41,7 @@ STATE_ICONS = {
     "loading": "⏳",
     "idle": "🎤",
     "recording": "🔴",
+    "handsfree": "🔒",
     "processing": "✍️",
     "error": "⚠️",
 }
