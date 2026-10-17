@@ -950,15 +950,35 @@ class HandsFreeTests(unittest.TestCase):
 
     # -- additions beyond the brief --
 
-    def test_command_press_in_grace_discards_tap_then_records_command(self):
+    def test_command_press_in_grace_reuses_the_open_stream(self):
+        """Stopping and restarting CoreAudio back-to-back is what the tap
+        window exists to avoid; the command records on the tap's stream."""
         self._tap()
+        old_max = self.p._max_timer
         self.p.on_hold_start("command")
         self.assertEqual(self.p._mode, "command")
         self.assertIsNone(self.p._tap_timer)
         self.assertTrue(self.p.recorder.recording)
-        self.assertEqual(self.p.recorder.stops, 1)  # the tap's stream
+        self.assertEqual(self.p.recorder.stops, 0)  # stream never restarted
+        self.assertEqual(self.p.recorder.clears, 1)  # tap audio dropped
         self.assertEqual(self.queued, [])
+        self.assertNotIn("idle", self.states)  # nothing was discarded
+        self.assertEqual(self.states[-1], "recording")
         self.assertEqual(self.p.overlay.styles[-1], "command")
+        self.sound.play_stop.assert_not_called()
+        self.assertEqual(self.sound.play_start.call_count, 2)
+        self.assertAlmostEqual(self.p.recorder.muted_for, 0.2 + 0.05)
+        self.assertLess(time.monotonic() - self.p._press_time, 0.5)
+        self.assertIsNot(self.p._max_timer, old_max)
+        self.assertEqual(self.p._max_timer.interval, 120.0)
+
+    def test_command_press_in_grace_then_release_queues_command(self):
+        self._tap()
+        self.p.on_hold_start("command")
+        self.p._press_time = time.monotonic() - 2.0
+        self.p.on_hold_end()
+        self.assertFalse(self.p.recorder.recording)
+        self.assertEqual(self.queued[-1][2], "command")
 
     def test_command_recording_is_queued_as_command(self):
         self.p.on_hold_start("dictation")

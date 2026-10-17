@@ -214,26 +214,32 @@ class Pipeline:
                     and not self._stopping):
                 if mode == "dictation":
                     self._enter_handsfree()
-                    return
-                then = "discard-tap"
-            elif (self.recorder.recording and not self._stopping
+                else:
+                    self._enter_command_from_tap()
+                return
+            if not (self.recorder.recording and not self._stopping
                     and self._mode == "handsfree"):
-                then = "finish"
-            else:
                 self._start_recording(mode)
                 return
         # _finish_recording takes the lock itself and blocks on the stop, so
-        # both follow-ups run after it is released.
-        if then == "finish":
-            self._finish_recording()
-            return
-        # A command press inside the tap window: drop the pending tap first,
-        # then record the command on a fresh stream. If the grace timer won
-        # the race and is already finishing, the start below is refused like
-        # any press during a stop.
-        self._finish_recording(discard=True)
-        with self._lock:
-            self._start_recording(mode)
+        # it runs after the lock is released.
+        self._finish_recording()
+
+    def _enter_command_from_tap(self):
+        """A command press inside the tap window: record the command on the
+        tap's still-open stream rather than stopping and restarting CoreAudio
+        back-to-back. Caller holds self._lock."""
+        self._tap_timer.cancel()
+        self._tap_timer = None
+        self.recorder.clear()
+        self._mode = "command"
+        self._press_time = time.monotonic()
+        if self.cfg.sounds:
+            self.recorder.mute_for(sound.start_duration_s() + CHIME_GUARD_S)
+            sound.play_start()
+        self.overlay.set_style("command")
+        self.set_state("recording")
+        self._restart_max_timer(self.cfg.max_duration_s)
 
     def _enter_handsfree(self):
         """Second press of a double tap: keep the open stream, drop the tap's
