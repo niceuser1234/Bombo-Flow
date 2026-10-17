@@ -107,6 +107,17 @@ class Store:
             self._conn.execute(
                 "ALTER TABLE history ADD COLUMN kind TEXT DEFAULT 'dictation'"
             )
+        if self._conn.execute("PRAGMA user_version").fetchone()[0] < 1:
+            # Until version 1 the app was the process's short name, which is
+            # "Code" for VS Code, and was looked up after processing, when
+            # our own dashboard could be frontmost and take the credit.
+            self._conn.execute(
+                "UPDATE history SET app = 'Visual Studio Code' WHERE app = 'Code'"
+            )
+            self._conn.execute(
+                "UPDATE history SET app = NULL WHERE app = 'Bomboclat Flow'"
+            )
+            self._conn.execute("PRAGMA user_version = 1")
         self._conn.commit()
 
     # -- history ----------------------------------------------------------
@@ -333,8 +344,8 @@ class Store:
                 cur_month_words += r["words"] or 0
             elif (y, m) == prev_month:
                 prev_month_words += r["words"] or 0
-            app_name = r["app"] or "Unknown"
-            app_counts[app_name] += 1
+            if r["app"]:
+                app_counts[r["app"]] += 1
             daily_words[local_date] += r["words"] or 0
             days_with_data.add(local_date)
 
@@ -345,10 +356,10 @@ class Store:
         else:
             month_trend_pct = 0
 
-        total_dictations = len(rows)
+        attributed = sum(app_counts.values())
         apps = []
         for name, count in sorted(app_counts.items(), key=lambda kv: kv[1], reverse=True)[:8]:
-            pct = round(count / total_dictations * 100) if total_dictations else 0
+            pct = round(count / attributed * 100) if attributed else 0
             apps.append({"name": name, "count": count, "pct": pct})
 
         cutoff_date = today_local - timedelta(days=150)

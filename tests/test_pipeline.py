@@ -132,6 +132,7 @@ def _build_pipeline():
     pipeline._recovery_lock = threading.Lock()
     pipeline._relaunch_pending = False
     pipeline._mode = None
+    pipeline._target_app = None
     pipeline._tap_timer = None
     pipeline._handsfree_entry_held = False
     pipeline._relaunched = []
@@ -768,7 +769,7 @@ class FreezeRecoveryTests(unittest.TestCase):
         with patch("flow.pipeline.STOP_TIMEOUT_S", 0.05), patch("flow.pipeline.sound"):
             self.p._finish_recording()
         self.assertEqual(len(self.queued), 2)
-        captured, _released_at, mode = self.queued[0]
+        captured, _released_at, mode, _app = self.queued[0]
         self.assertEqual(len(captured), 16000)
         self.assertEqual(mode, "dictation")
         self.assertIsNone(self.queued[1])
@@ -785,10 +786,10 @@ class FreezeRecoveryTests(unittest.TestCase):
         p = _build_pipeline()
         p._queue = queue_mod.Queue()
         order = []
-        p._process = lambda captured, released_at, mode="dictation": order.append("processed")
+        p._process = lambda captured, released_at, mode="dictation", app=None: order.append("processed")
         p._relaunch = lambda reason: order.append("relaunch")
         p._load_model = lambda: True
-        p._queue.put((np.zeros(10, dtype=np.float32), 0.0, "dictation"))
+        p._queue.put((np.zeros(10, dtype=np.float32), 0.0, "dictation", None))
         p._queue.put(None)
         p._worker()  # returns after the sentinel
         self.assertEqual(order, ["processed", "relaunch"])
@@ -1139,3 +1140,96 @@ class RewritePathTests(unittest.TestCase):
     def test_dictation_mode_still_uses_cleanup_path(self):
         self.p._process(np.zeros(16000, dtype=np.float32), time.monotonic(), "dictation")
         self.p.cleaner.rewrite.assert_not_called()
+
+
+class _FakeRunningApp:
+    def __init__(self, name, bundle_id, path, pid=99999):
+        self._name, self._bundle_id, self._path, self._pid = name, bundle_id, path, pid
+
+    def localizedName(self):
+        return self._name
+
+    def bundleIdentifier(self):
+        return self._bundle_id
+
+    def processIdentifier(self):
+        return self._pid
+
+    def bundleURL(self):
+        if self._path is None:
+            return None
+        return type("_URL", (), {"path": lambda s, p=self._path: p})()
+
+
+class AppAttributionTests(unittest.TestCase):
+    """Desktop usage must name the app the user dictated into, the way the
+    user knows it — VS Code reports itself as "Code" — and never our own
+    window."""
+
+    def test_uses_the_finder_name_not_the_short_process_name(self):
+        from flow import pipeline
+
+        vscode = _FakeRunningApp(
+            "Code", "com.microsoft.VSCode", "/Applications/Visual Studio Code.app"
+        )
+        with patch.object(pipeline, "_finder_name", return_value="Visual Studio Code"):
+            self.assertEqual(pipeline._app_display_name(vscode), "Visual Studio Code")
+
+    def test_strips_a_visible_app_extension(self):
+        from flow import pipeline
+
+        app = _FakeRunningApp("Notes", "com.apple.Notes", "/System/Applications/Notes.app")
+        with patch.object(pipeline, "_finder_name", return_value="Notes.app"):
+            self.assertEqual(pipeline._app_display_name(app), "Notes")
+
+    def test_falls_back_to_the_process_name_without_a_bundle(self):
+        from flow import pipeline
+
+        app = _FakeRunningApp("some-tool", None, None)
+        self.assertEqual(pipeline._app_display_name(app), "some-tool")
+
+    def test_our_own_window_is_not_an_app_the_user_dictated_into(self):
+        from flow import pipeline
+
+        own = _FakeRunningApp(
+            "Bomboclat Flow", "com.bomboclat.flow", "/Applications/Bomboclat Flow.app"
+        )
+        self.assertIsNone(pipeline._app_display_name(own))
+
+    def test_our_own_process_in_dev_mode_is_excluded_too(self):
+        import os
+
+        from flow import pipeline
+
+        dev = _FakeRunningApp("Python", "org.python.python", "/x/Python.app", pid=os.getpid())
+        self.assertIsNone(pipeline._app_display_name(dev))
+
+    def test_the_app_is_taken_when_the_key_is_pressed(self):
+        """Processing takes seconds; by then the user may have switched to
+        another window (or our dashboard), which used to get the credit."""
+        p = _build_pipeline()
+        p.engine = object()
+        queued = []
+        p._queue = type("_Q", (), {"put": lambda s, item: queued.append(item)})()
+        with patch("flow.pipeline.sound"), \
+             patch("flow.pipeline.audio_mod.is_silent", return_value=False), \
+             patch("flow.pipeline._frontmost_app", return_value="Claude"):
+            p.on_hold_start("dictation")
+        p._press_time = time.monotonic() - 2.0
+        with patch("flow.pipeline.sound"), \
+             patch("flow.pipeline.audio_mod.is_silent", return_value=False), \
+             patch("flow.pipeline._frontmost_app", return_value="Bomboclat Flow"):
+            p.on_hold_end()
+        self.assertEqual(queued[-1][3], "Claude")
+
+    def test_dictation_is_stored_under_the_app_from_the_press(self):
+        p = _build_pipeline()
+        p.engine = type("E", (), {"transcribe": lambda s, a, initial_prompt=None: "hallo welt"})()
+        store = _FakeStore()
+        store.add_dictation = mock.Mock()
+        with patch("flow.pipeline.get_store", return_value=store), \
+             patch("flow.pipeline.insert_text"), \
+             patch("flow.pipeline._frontmost_app", return_value="Bomboclat Flow"):
+            p._process(np.zeros(16000, dtype=np.float32), time.monotonic(),
+                       "dictation", "Visual Studio Code")
+        self.assertEqual(store.add_dictation.call_args.kwargs["app"], "Visual Studio Code")

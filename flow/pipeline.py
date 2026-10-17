@@ -7,6 +7,7 @@ State changes are reported via a callback so the menu bar can reflect them.
 import difflib
 import functools
 import logging
+import os
 import queue
 import re
 import threading
@@ -39,12 +40,41 @@ CHIME_GUARD_S = 0.05
 DOUBLE_TAP_S = 0.4
 
 
+OWN_BUNDLE_ID = "com.bomboclat.flow"
+
+
+def _finder_name(path: str) -> str | None:
+    from AppKit import NSFileManager
+
+    name = NSFileManager.defaultManager().displayNameAtPath_(path)
+    return str(name) if name else None
+
+
+def _app_display_name(app) -> str | None:
+    """The app's name as the user knows it from Finder and the Dock.
+
+    localizedName() is the process's short name, and for VS Code that is
+    "Code". Our own window never counts: dictating into the dashboard is not
+    use of another app.
+    """
+    if app is None:
+        return None
+    if app.bundleIdentifier() == OWN_BUNDLE_ID or app.processIdentifier() == os.getpid():
+        return None
+    url = app.bundleURL()
+    if url is not None:
+        name = _finder_name(url.path())
+        if name:
+            return name.removesuffix(".app")
+    name = app.localizedName()
+    return str(name) if name else None
+
+
 def _frontmost_app() -> str | None:
     try:
         from AppKit import NSWorkspace
 
-        app = NSWorkspace.sharedWorkspace().frontmostApplication()
-        return str(app.localizedName()) if app else None
+        return _app_display_name(NSWorkspace.sharedWorkspace().frontmostApplication())
     except Exception:
         return None
 
@@ -139,6 +169,10 @@ class Pipeline:
         # The running recording's mode: "dictation", "command" or
         # "handsfree"; None while idle.
         self._mode: str | None = None
+        # The app the user was in when the recording began — where the text
+        # is meant to land. Looked up at the press, not after processing,
+        # when the user may have moved on.
+        self._target_app: str | None = None
         # Pending after a short tap: a second press inside the window turns
         # the still-open recording into hands-free, otherwise it is dropped.
         self._tap_timer: threading.Timer | None = None
@@ -284,6 +318,7 @@ class Pipeline:
             log.debug("on_hold_start skipped: audio recovery in progress")
             return
         self._press_time = time.monotonic()
+        self._target_app = _frontmost_app()
         finished, _, error = self._run_bounded(
             self.recorder.start, START_TIMEOUT_S, "recorder-start"
         )
@@ -373,6 +408,7 @@ class Pipeline:
                 self._max_timer = None
             duration = time.monotonic() - self._press_time
             mode = self._mode or "dictation"
+            app = self._target_app
         # _stopping stays True until the tail below finishes, so a fast
         # re-press cannot start a recording whose state/overlay this old
         # press would then stomp. The blocking stop still runs lock-free.
@@ -387,7 +423,7 @@ class Pipeline:
                         and len(captured)
                         and not audio_mod.is_silent(captured)):
                     self.set_state("processing")
-                    self._queue.put((captured, time.monotonic(), mode))
+                    self._queue.put((captured, time.monotonic(), mode, app))
                 self._request_relaunch("recorder.stop() hung")
                 return
             if self._relaunch_pending:
@@ -422,10 +458,11 @@ class Pipeline:
             else:
                 self.overlay.hide()
             self.set_state("processing")
-            self._queue.put((captured, time.monotonic(), mode))
+            self._queue.put((captured, time.monotonic(), mode, app))
         finally:
             with self._lock:
                 self._mode = None
+                self._target_app = None
                 self._handsfree_entry_held = False
                 self._stopping = False
 
@@ -575,9 +612,9 @@ class Pipeline:
             if item is None:
                 self._relaunch("CoreAudio wedged")
                 return
-            captured, released_at, mode = item
+            captured, released_at, mode, app = item
             try:
-                self._process(captured, released_at, mode)
+                self._process(captured, released_at, mode, app)
             except Exception:
                 log.exception("Pipeline processing failed")
                 self.set_state("error")
@@ -586,14 +623,14 @@ class Pipeline:
                 if self._queue.empty() and not self.recorder.recording:
                     self.set_state("idle")
 
-    def _process_rewrite(self, captured, released_at):
+    def _process_rewrite(self, captured, released_at, app=None):
         """Rewrite mode: the recording is an instruction for the selection.
 
         Never raises: the "Rewriting…" pill is persistent, so any failure must
         replace it with a message rather than leave it on screen.
         """
         try:
-            self._rewrite(captured, released_at)
+            self._rewrite(captured, released_at, app)
         except Exception:
             log.exception("Rewrite failed")
             self._rewrite_feedback("Rewrite failed")
@@ -608,7 +645,7 @@ class Pipeline:
         else:
             self.overlay.flash(message, 2.0)
 
-    def _rewrite(self, captured, released_at):
+    def _rewrite(self, captured, released_at, app=None):
         instruction = self.engine.transcribe(captured).strip()
         log.info("Rewrite instruction (%.2fs): %d chars",
                  time.monotonic() - released_at, len(instruction))
@@ -631,7 +668,7 @@ class Pipeline:
             get_store().add_dictation(
                 instruction, result,
                 duration_s=len(captured) / self.recorder.samplerate,
-                app=_frontmost_app(), corrected_words=0, dict_fixes=0,
+                app=app, corrected_words=0, dict_fixes=0,
                 kind="rewrite",
             )
         except Exception:
@@ -640,9 +677,9 @@ class Pipeline:
         log.info("Rewrote %d -> %d chars after %.2fs total",
                  len(selection), len(result), time.monotonic() - released_at)
 
-    def _process(self, captured, released_at, mode="dictation"):
+    def _process(self, captured, released_at, mode="dictation", app=None):
         if mode == "command":
-            self._process_rewrite(captured, released_at)
+            self._process_rewrite(captured, released_at, app)
             return
         store = get_store()
         # Two lists on purpose: the cleanup LLM sees the whole dictionary (it
@@ -667,7 +704,6 @@ class Pipeline:
             log.info("Cleaned (%.2fs): %d chars",
                      time.monotonic() - t_stt, len(text))
             log.debug("Cleaned text: %r", text)
-        app_name = _frontmost_app()
         # Persist before inserting. Insertion is the step that can fail for
         # reasons outside our control (wedged main thread, refused pasteboard),
         # and a transcript that only exists in the history is recoverable —
@@ -677,7 +713,7 @@ class Pipeline:
             store.add_dictation(
                 raw, text,
                 duration_s=len(captured) / self.recorder.samplerate,
-                app=app_name,
+                app=app,
                 corrected_words=_words_changed(raw, text),
                 dict_fixes=_dict_fixes(vocabulary, raw, text),
             )

@@ -180,3 +180,39 @@ def test_insights_ignore_rewrites():
         assert ins["totalWords"] == 3
         kinds = [e["kind"] for e in s.history()]
         assert sorted(kinds) == ["dictation", "rewrite"]
+
+
+def test_legacy_app_names_are_fixed_once():
+    """Before the attribution fix, VS Code was stored as "Code" and our own
+    dashboard could take the credit for a dictation."""
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "store.db"
+        s = Store(db_path=db)
+        s.add_dictation("a", "a", 1.0, "Code", 0, 0)
+        s.add_dictation("b", "b", 1.0, "Bomboclat Flow", 0, 0)
+        s.add_dictation("c", "c", 1.0, "Claude", 0, 0)
+        s._conn.execute("PRAGMA user_version = 0")
+        s._conn.commit()
+        s._conn.close()
+
+        s = Store(db_path=db)
+        apps = sorted((e["app"] or "") for e in s.history())
+        assert apps == ["", "Claude", "Visual Studio Code"]
+
+        # Runs once: an app genuinely called "Code" added later stays as is.
+        s.add_dictation("d", "d", 1.0, "Code", 0, 0)
+        s._conn.close()
+        s = Store(db_path=db)
+        assert "Code" in [e["app"] for e in s.history()]
+
+
+def test_desktop_usage_only_counts_dictations_with_a_known_app():
+    with tempfile.TemporaryDirectory() as tmp:
+        s = _store(tmp)
+        s.add_dictation("a", "a", 1.0, "Claude", 0, 0)
+        s.add_dictation("b", "b", 1.0, "Claude", 0, 0)
+        s.add_dictation("c", "c", 1.0, "Visual Studio Code", 0, 0)
+        s.add_dictation("d", "d", 1.0, None, 0, 0)
+        apps = s.insights()["apps"]
+        assert [a["name"] for a in apps] == ["Claude", "Visual Studio Code"]
+        assert [a["pct"] for a in apps] == [67, 33]
