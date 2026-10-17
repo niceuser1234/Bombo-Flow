@@ -368,7 +368,9 @@
         <div class="etime">${localTime(e.ts)}</div>
         <div class="ebody">
           <div class="etext">${esc(e.text)}</div>
-          ${e.app ? `<div class="emeta"><span class="eapp">${esc(e.app)}</span></div>` : ""}
+          ${e.app || e.kind === "rewrite"
+            ? `<div class="emeta">${e.kind === "rewrite" ? `<span class="ebadge">Rewrite</span>` : ""}${e.app ? `<span class="eapp">${esc(e.app)}</span>` : ""}</div>`
+            : ""}
         </div>
         ${e.pinned ? `<span class="pin-static">${ICON.pinFilled}</span>` : ""}
         <div class="eactions">

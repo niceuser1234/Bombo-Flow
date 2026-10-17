@@ -101,18 +101,25 @@ class Store:
                 first_seen TEXT
             );
         """)
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(history)")}
+        if "kind" not in cols:
+            # Existing rows are all dictations — the DEFAULT backfills them.
+            self._conn.execute(
+                "ALTER TABLE history ADD COLUMN kind TEXT DEFAULT 'dictation'"
+            )
         self._conn.commit()
 
     # -- history ----------------------------------------------------------
 
-    def add_dictation(self, raw, text, duration_s, app, corrected_words, dict_fixes) -> int:
+    def add_dictation(self, raw, text, duration_s, app, corrected_words, dict_fixes,
+                     kind="dictation") -> int:
         words = len(text.split()) if text else 0
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO history "
-                "(ts, raw, text, pinned, app, words, duration_s, corrected_words, dict_fixes) "
-                "VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)",
-                (_utcnow(), raw, text, app, words, duration_s, corrected_words, dict_fixes),
+                "(ts, raw, text, pinned, app, words, duration_s, corrected_words, dict_fixes, kind) "
+                "VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
+                (_utcnow(), raw, text, app, words, duration_s, corrected_words, dict_fixes, kind),
             )
             self._conn.commit()
             return cur.lastrowid
@@ -120,7 +127,7 @@ class Store:
     def history(self) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, ts, raw, text, pinned, app, words, duration_s "
+                "SELECT id, ts, raw, text, pinned, app, words, duration_s, kind "
                 "FROM history ORDER BY id DESC"
             ).fetchall()
         return [
@@ -128,6 +135,7 @@ class Store:
                 "id": r["id"], "ts": r["ts"], "raw": r["raw"], "text": r["text"],
                 "pinned": bool(r["pinned"]), "app": r["app"],
                 "words": r["words"], "duration_s": r["duration_s"],
+                "kind": r["kind"] or "dictation",
             }
             for r in rows
         ]
@@ -295,7 +303,8 @@ class Store:
     def insights(self) -> dict:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT ts, words, duration_s, app, corrected_words, dict_fixes FROM history"
+                "SELECT ts, words, duration_s, app, corrected_words, dict_fixes FROM history "
+                "WHERE COALESCE(kind, 'dictation') = 'dictation'"
             ).fetchall()
 
         total_words = sum(r["words"] or 0 for r in rows)

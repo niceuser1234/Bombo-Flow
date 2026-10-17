@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import threading
 from pathlib import Path
@@ -148,3 +149,34 @@ def test_bump_uses_is_case_insensitive_and_ignores_empty():
         store.bump_uses(["kubernetes"])  # NOCASE primary key must match
 
         assert store.dictionary_words() == ["Kubernetes", "Alpha"]
+
+
+def _store(tmp):
+    return Store(db_path=Path(tmp) / "store.db")
+
+
+def test_kind_column_migrates_an_existing_db():
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "store.db"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE history (id INTEGER PRIMARY KEY, ts TEXT, raw TEXT, text TEXT,"
+                    " pinned INTEGER DEFAULT 0, app TEXT, words INTEGER, duration_s REAL,"
+                    " corrected_words INTEGER DEFAULT 0, dict_fixes INTEGER DEFAULT 0)")
+        con.execute("INSERT INTO history (ts, raw, text, words, duration_s) VALUES"
+                    " ('2026-10-01T10:00:00+00:00', 'a', 'a', 1, 1.0)")
+        con.commit()
+        con.close()
+        s = Store(db_path=db)
+        Store(db_path=db)  # second open: migration must be idempotent
+        assert s.history()[0]["kind"] == "dictation"
+
+
+def test_insights_ignore_rewrites():
+    with tempfile.TemporaryDirectory() as tmp:
+        s = _store(tmp)
+        s.add_dictation("r", "one two three", 1.0, "Notes", 0, 0)
+        s.add_dictation("make it formal", "a b c d e f g h", 1.0, "Mail", 0, 0, kind="rewrite")
+        ins = s.insights()
+        assert ins["totalWords"] == 3
+        kinds = [e["kind"] for e in s.history()]
+        assert sorted(kinds) == ["dictation", "rewrite"]

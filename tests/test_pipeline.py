@@ -31,7 +31,7 @@ class _Overlay:
         self.styles.append(style)
 
     def flash(self, message, seconds=2.0):
-        self.flashes.append(message)
+        self.flashes.append((message, seconds))
 
     def hide(self):
         pass
@@ -961,3 +961,56 @@ class HandsFreeTests(unittest.TestCase):
         self.assertEqual(self.queued[0][2], "handsfree")
         self.assertIsNone(self.queued[1])
         self.assertTrue(self.p._relaunch_pending)
+
+
+class RewritePathTests(unittest.TestCase):
+    def setUp(self):
+        self.p = _build_pipeline()
+        self.p.engine = type("E", (), {"transcribe": lambda s, a, initial_prompt=None: "mach Stichpunkte"})()
+        self.p.cleaner = mock.Mock()
+        self.p.cleaner.available = True
+        self.p.cleaner.rewrite.return_value = "- a\n- b"
+        self.store = _FakeStore()
+        self.store.add_dictation = mock.Mock()
+        patch("flow.pipeline.get_store", return_value=self.store).start()
+        self.grab = patch("flow.pipeline.transform.grab_selection", return_value="a b").start()
+        self.insert = patch("flow.pipeline.insert_text").start()
+        patch("flow.pipeline._frontmost_app", return_value="Notes").start()
+        self.addCleanup(patch.stopall)
+
+    def _run(self):
+        self.p._process(np.zeros(16000, dtype=np.float32), time.monotonic(), "command")
+
+    def test_success_pastes_rewrite_and_records_it(self):
+        self._run()
+        self.p.cleaner.rewrite.assert_called_once_with("a b", "mach Stichpunkte")
+        self.insert.assert_called_once_with("- a\n- b", mode="paste")
+        self.assertEqual(self.store.add_dictation.call_args.kwargs["kind"], "rewrite")
+
+    def test_no_selection_pastes_nothing(self):
+        self.grab.return_value = None
+        self._run()
+        self.insert.assert_not_called()
+        self.assertIn(("Select some text first", 2.0), self.p.overlay.flashes)
+
+    def test_failed_rewrite_pastes_nothing(self):
+        self.p.cleaner.rewrite.return_value = None
+        self._run()
+        self.insert.assert_not_called()
+        self.assertIn(("Rewrite failed", 2.0), self.p.overlay.flashes)
+
+    def test_empty_instruction_pastes_nothing(self):
+        self.p.engine = type("E", (), {"transcribe": lambda s, a, initial_prompt=None: ""})()
+        self._run()
+        self.grab.assert_not_called()
+        self.assertIn(("Didn't catch that", 2.0), self.p.overlay.flashes)
+
+    def test_no_api_key_pastes_nothing(self):
+        self.p.cleaner.available = False
+        self._run()
+        self.grab.assert_not_called()
+        self.assertIn(("Rewrite needs an API key", 2.0), self.p.overlay.flashes)
+
+    def test_dictation_mode_still_uses_cleanup_path(self):
+        self.p._process(np.zeros(16000, dtype=np.float32), time.monotonic(), "dictation")
+        self.p.cleaner.rewrite.assert_not_called()

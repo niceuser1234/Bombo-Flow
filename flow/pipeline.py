@@ -16,6 +16,7 @@ from . import audio as audio_mod
 from . import lifecycle
 from . import sound
 from . import stt
+from . import transform
 from .audio import Recorder
 from .cleanup import Cleaner
 from .insert import insert_text
@@ -352,8 +353,8 @@ class Pipeline:
             if self.cfg.sounds:
                 sound.play_stop()
 
-            self.overlay.hide()
             if timed_out:
+                self.overlay.hide()
                 if (not discard and duration >= self.cfg.min_duration_s
                         and len(captured)
                         and not audio_mod.is_silent(captured)):
@@ -362,14 +363,17 @@ class Pipeline:
                 self._request_relaunch("recorder.stop() hung")
                 return
             if discard or duration < self.cfg.min_duration_s:
+                self.overlay.hide()
                 log.info("Discarding %.2fs tap", duration)
                 self.set_state("idle")
                 return
             if len(captured) == 0:
+                self.overlay.hide()
                 log.warning("recorder.stop() returned no audio")
                 self._enter_error_then_idle()
                 return
             if audio_mod.is_silent(captured):
+                self.overlay.hide()
                 log.warning(
                     "Recording is silent — resetting audio stack (stale "
                     "input device?). If this repeats, check Microphone "
@@ -377,6 +381,10 @@ class Pipeline:
                 )
                 self._schedule_recovery()
                 return
+            if mode == "command":
+                self.overlay.flash("Rewriting…", seconds=None)
+            else:
+                self.overlay.hide()
             self.set_state("processing")
             self._queue.put((captured, time.monotonic(), mode))
         finally:
@@ -523,7 +531,43 @@ class Pipeline:
                 if self._queue.empty() and not self.recorder.recording:
                     self.set_state("idle")
 
+    def _process_rewrite(self, captured, released_at):
+        """Rewrite mode: the recording is an instruction for the selection."""
+        instruction = self.engine.transcribe(captured).strip()
+        log.info("Rewrite instruction (%.2fs): %d chars",
+                 time.monotonic() - released_at, len(instruction))
+        if len(instruction) < 2:
+            self.overlay.flash("Didn't catch that", 2.0)
+            return
+        if not self.cleaner.available:
+            self.overlay.flash("Rewrite needs an API key", 2.0)
+            return
+        selection = transform.grab_selection()
+        if not selection:
+            self.overlay.flash("Select some text first", 2.0)
+            return
+        result = self.cleaner.rewrite(selection, instruction)
+        if not result:
+            self.overlay.flash("Rewrite failed", 2.0)
+            return
+        self.overlay.hide()
+        try:
+            get_store().add_dictation(
+                instruction, result,
+                duration_s=len(captured) / self.recorder.samplerate,
+                app=_frontmost_app(), corrected_words=0, dict_fixes=0,
+                kind="rewrite",
+            )
+        except Exception:
+            log.exception("Storing rewrite failed")
+        insert_text(result, mode=self.cfg.insert_mode)
+        log.info("Rewrote %d -> %d chars after %.2fs total",
+                 len(selection), len(result), time.monotonic() - released_at)
+
     def _process(self, captured, released_at, mode="dictation"):
+        if mode == "command":
+            self._process_rewrite(captured, released_at)
+            return
         store = get_store()
         # Two lists on purpose: the cleanup LLM sees the whole dictionary (it
         # has the surrounding text and is told not to insert unspoken terms),
