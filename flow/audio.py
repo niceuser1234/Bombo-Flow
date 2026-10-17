@@ -138,6 +138,10 @@ class Recorder:
         if seconds > 0:
             self._muted_until = time.monotonic() + seconds
 
+    def clear(self):
+        """Drop what was captured so far (the double tap's first press)."""
+        self._chunks = []
+
     def _callback(self, indata, frames, time_info, status):
         if self._discard:
             return
@@ -163,6 +167,16 @@ class Recorder:
         audio = np.concatenate(self._chunks)[:, 0]
         self._chunks = []
         return audio
+
+    def rescue(self) -> np.ndarray:
+        """Audio captured so far, for a stream whose stop() wedged.
+
+        Copies the chunk list first: the CoreAudio callback may still append
+        to it from its own thread until abandon() flips _discard."""
+        chunks = list(self._chunks)
+        if not chunks:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(chunks)[:, 0]
 
     def abandon(self):
         """Give up on a wedged stream: stop feeding the callback and close

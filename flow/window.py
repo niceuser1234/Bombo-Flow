@@ -195,6 +195,7 @@ class MainWindow:
                 {
                     "id": e["id"], "ts": e["ts"], "text": e["text"],
                     "pinned": e["pinned"], "app": e["app"],
+                    "kind": e.get("kind", "dictation"),
                 }
                 for e in store.history()
             ]

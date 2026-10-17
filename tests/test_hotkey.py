@@ -30,12 +30,18 @@ class _Recorder:
     def __init__(self):
         self.starts = 0
         self.ends = 0
+        self.modes = []
+        self.mode_changes = []
 
-    def start(self):
+    def start(self, mode="dictation"):
         self.starts += 1
+        self.modes.append(mode)
 
     def end(self):
         self.ends += 1
+
+    def change(self, mode):
+        self.mode_changes.append(mode)
 
 
 class FnDispatchTests(unittest.TestCase):
@@ -61,7 +67,7 @@ class FnDispatchTests(unittest.TestCase):
         self.assertEqual(self.rec.ends, 0)
 
     def test_callback_exception_does_not_propagate(self):
-        def boom():
+        def boom(*_):
             raise RuntimeError("nope")
 
         listener = FnHotkeyListener(boom, boom, runner=_direct)
@@ -198,6 +204,53 @@ class FnDispatchTests(unittest.TestCase):
         self.assertEqual(self.rec.starts, 2)
 
 
+class FnControlTests(unittest.TestCase):
+    def setUp(self):
+        self.rec = _Recorder()
+        self.listener = FnHotkeyListener(
+            self.rec.start, self.rec.end, runner=_direct, on_mode_change=self.rec.change
+        )
+
+    def test_plain_fn_is_dictation(self):
+        self.listener._dispatch(fn_down=True)
+        self.listener._dispatch(fn_down=False)
+        self.assertEqual(self.rec.modes, ["dictation"])
+
+    def test_control_then_fn_is_command(self):
+        self.listener._dispatch(fn_down=True, ctrl_down=True)
+        self.assertEqual(self.rec.modes, ["command"])
+        self.assertEqual(self.rec.mode_changes, [])
+
+    def test_fn_then_control_switches_to_command_once(self):
+        self.listener._dispatch(fn_down=True)
+        self.listener._dispatch(fn_down=True, ctrl_down=True)
+        self.listener._dispatch(fn_down=True, ctrl_down=False)
+        self.listener._dispatch(fn_down=True, ctrl_down=True)
+        self.assertEqual(self.rec.modes, ["dictation"])
+        self.assertEqual(self.rec.mode_changes, ["command"])
+
+    def test_control_without_fn_does_nothing(self):
+        self.listener._dispatch(fn_down=False, ctrl_down=True)
+        self.assertEqual(self.rec.starts, 0)
+
+    def test_handle_event_reads_control_flag(self):
+        from AppKit import NSEventModifierFlagControl, NSEventModifierFlagFunction
+
+        class FakeEvent:
+            def __init__(self, flags):
+                self._flags = flags
+
+            def modifierFlags(self):
+                return self._flags
+
+        self.listener._handle_event(FakeEvent(NSEventModifierFlagFunction))
+        # Within the debounce window, but Control changed — must not be gated.
+        self.listener._handle_event(
+            FakeEvent(NSEventModifierFlagFunction | NSEventModifierFlagControl)
+        )
+        self.assertEqual(self.rec.mode_changes, ["command"])
+
+
 class FnRunsOffMainThreadTests(unittest.TestCase):
     """The Fn monitor handler is delivered on the AppKit main thread.
 
@@ -210,7 +263,7 @@ class FnRunsOffMainThreadTests(unittest.TestCase):
         ran_on = []
         done = threading.Event()
 
-        def on_start():
+        def on_start(*_):
             ran_on.append(threading.current_thread().ident)
             done.set()
 
@@ -228,7 +281,7 @@ class FnRunsOffMainThreadTests(unittest.TestCase):
         entered = threading.Event()
         release = threading.Event()
 
-        def stuck_start():
+        def stuck_start(*_):
             entered.set()
             release.wait(5.0)  # stands in for a wedged CoreAudio start
 
@@ -250,7 +303,7 @@ class FnRunsOffMainThreadTests(unittest.TestCase):
             seen.append("end")
             done.set()
 
-        listener = FnHotkeyListener(lambda: seen.append("start"), on_end)
+        listener = FnHotkeyListener(lambda *a: seen.append("start"), on_end)
         listener.start_dispatcher()
         try:
             listener._dispatch(fn_down=True)
@@ -264,7 +317,7 @@ class FnRunsOffMainThreadTests(unittest.TestCase):
     def test_callback_exception_does_not_kill_the_dispatch_thread(self):
         done = threading.Event()
 
-        def boom():
+        def boom(*_):
             raise RuntimeError("nope")
 
         listener = FnHotkeyListener(boom, done.set)

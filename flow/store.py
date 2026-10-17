@@ -101,18 +101,36 @@ class Store:
                 first_seen TEXT
             );
         """)
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(history)")}
+        if "kind" not in cols:
+            # Existing rows are all dictations — the DEFAULT backfills them.
+            self._conn.execute(
+                "ALTER TABLE history ADD COLUMN kind TEXT DEFAULT 'dictation'"
+            )
+        if self._conn.execute("PRAGMA user_version").fetchone()[0] < 1:
+            # Until version 1 the app was the process's short name, which is
+            # "Code" for VS Code, and was looked up after processing, when
+            # our own dashboard could be frontmost and take the credit.
+            self._conn.execute(
+                "UPDATE history SET app = 'Visual Studio Code' WHERE app = 'Code'"
+            )
+            self._conn.execute(
+                "UPDATE history SET app = NULL WHERE app = 'Bomboclat Flow'"
+            )
+            self._conn.execute("PRAGMA user_version = 1")
         self._conn.commit()
 
     # -- history ----------------------------------------------------------
 
-    def add_dictation(self, raw, text, duration_s, app, corrected_words, dict_fixes) -> int:
+    def add_dictation(self, raw, text, duration_s, app, corrected_words, dict_fixes,
+                     kind="dictation") -> int:
         words = len(text.split()) if text else 0
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO history "
-                "(ts, raw, text, pinned, app, words, duration_s, corrected_words, dict_fixes) "
-                "VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)",
-                (_utcnow(), raw, text, app, words, duration_s, corrected_words, dict_fixes),
+                "(ts, raw, text, pinned, app, words, duration_s, corrected_words, dict_fixes, kind) "
+                "VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
+                (_utcnow(), raw, text, app, words, duration_s, corrected_words, dict_fixes, kind),
             )
             self._conn.commit()
             return cur.lastrowid
@@ -120,7 +138,7 @@ class Store:
     def history(self) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, ts, raw, text, pinned, app, words, duration_s "
+                "SELECT id, ts, raw, text, pinned, app, words, duration_s, kind "
                 "FROM history ORDER BY id DESC"
             ).fetchall()
         return [
@@ -128,6 +146,7 @@ class Store:
                 "id": r["id"], "ts": r["ts"], "raw": r["raw"], "text": r["text"],
                 "pinned": bool(r["pinned"]), "app": r["app"],
                 "words": r["words"], "duration_s": r["duration_s"],
+                "kind": r["kind"] or "dictation",
             }
             for r in rows
         ]
@@ -295,7 +314,8 @@ class Store:
     def insights(self) -> dict:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT ts, words, duration_s, app, corrected_words, dict_fixes FROM history"
+                "SELECT ts, words, duration_s, app, corrected_words, dict_fixes FROM history "
+                "WHERE COALESCE(kind, 'dictation') = 'dictation'"
             ).fetchall()
 
         total_words = sum(r["words"] or 0 for r in rows)
@@ -324,8 +344,8 @@ class Store:
                 cur_month_words += r["words"] or 0
             elif (y, m) == prev_month:
                 prev_month_words += r["words"] or 0
-            app_name = r["app"] or "Unknown"
-            app_counts[app_name] += 1
+            if r["app"]:
+                app_counts[r["app"]] += 1
             daily_words[local_date] += r["words"] or 0
             days_with_data.add(local_date)
 
@@ -336,10 +356,10 @@ class Store:
         else:
             month_trend_pct = 0
 
-        total_dictations = len(rows)
+        attributed = sum(app_counts.values())
         apps = []
         for name, count in sorted(app_counts.items(), key=lambda kv: kv[1], reverse=True)[:8]:
-            pct = round(count / total_dictations * 100) if total_dictations else 0
+            pct = round(count / attributed * 100) if attributed else 0
             apps.append({"name": name, "count": count, "pct": pct})
 
         cutoff_date = today_local - timedelta(days=150)

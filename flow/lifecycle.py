@@ -10,6 +10,7 @@ from __future__ import annotations
 import fcntl
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -244,3 +245,45 @@ def _dump_stacks() -> None:
     for tid, frame in sorted(frames.items()):
         stack = traceback.format_stack(frame)
         log.error("Thread %d stack:\n%s", tid, "".join(stack))
+
+
+# Waits for the old process ($0 = its pid) to exit — it holds the
+# single-instance lock until then — and only then starts the new one.
+_WAIT_THEN_EXEC = 'while kill -0 "$0" 2>/dev/null; do sleep 0.2; done; exec "$@"'
+
+
+def relaunch_command(pid: int, executable: str, frozen: bool, project_root: Path) -> list[str]:
+    """Shell command that starts a fresh copy of the app once `pid` is gone.
+    `--background` keeps the dashboard from popping up on a relaunch."""
+    if frozen:
+        bundle = str(Path(executable).resolve().parents[2])
+        target = ["open", bundle, "--args", "--background"]
+    else:
+        target = [executable, "-m", "flow", "--background"]
+    return ["/bin/sh", "-c", _WAIT_THEN_EXEC, str(pid), *target]
+
+
+def relaunch(reason: str) -> None:
+    """Replace this process with a fresh one.
+
+    A CoreAudio HAL that wedged inside AudioDeviceStop never recovers within
+    the process: every later stream open blocks forever. Restarting is the
+    only cure, so do it for the user instead of leaving the hotkey dead.
+    """
+    from .config import IS_FROZEN, PROJECT_ROOT
+
+    log.error("Relaunching the app: %s", reason)
+    _dump_stacks()
+    try:
+        subprocess.Popen(
+            relaunch_command(os.getpid(), sys.executable, IS_FROZEN, PROJECT_ROOT),
+            cwd=str(PROJECT_ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        log.exception("Could not spawn the relaunch helper")
+    # os._exit: an orderly shutdown would join threads stuck in CoreAudio.
+    os._exit(0)

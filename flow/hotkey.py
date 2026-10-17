@@ -167,10 +167,13 @@ class FnHotkeyListener:
     callback to `runner`, which is a background thread by default.
     """
 
-    def __init__(self, on_hold_start, on_hold_end, runner=None):
+    def __init__(self, on_hold_start, on_hold_end, runner=None, on_mode_change=None):
         self._on_hold_start = on_hold_start
         self._on_hold_end = on_hold_end
+        self._on_mode_change = on_mode_change
         self._held = False
+        self._ctrl = False
+        self._mode = "dictation"
         self._monitor = None
         self._local_monitor = None
         self._last_event_time = 0.0
@@ -212,34 +215,51 @@ class FnHotkeyListener:
         return event
 
     def _handle_event(self, event):
-        from AppKit import NSEventModifierFlagFunction
+        from AppKit import NSEventModifierFlagControl, NSEventModifierFlagFunction
 
         now = time.monotonic()
-        fn_down = bool(event.modifierFlags() & NSEventModifierFlagFunction)
-        # Only gate events that would not change the held state. Gating on
-        # `fn_down` alone swallowed a genuine press arriving within 50 ms of a
-        # release, and since flagsChanged is edge-triggered no further event
-        # comes while Fn stays down — the whole dictation was lost silently.
-        if fn_down == self._held and now - self._last_event_time < DEBOUNCE_S:
+        flags = event.modifierFlags()
+        fn_down = bool(flags & NSEventModifierFlagFunction)
+        ctrl_down = bool(flags & NSEventModifierFlagControl)
+        # Only gate events that change nothing we track. Gating on `fn_down`
+        # alone swallowed a genuine press arriving within 50 ms of a release,
+        # and since flagsChanged is edge-triggered no further event comes while
+        # Fn stays down — the whole dictation was lost silently.
+        if (fn_down == self._held and ctrl_down == self._ctrl
+                and now - self._last_event_time < DEBOUNCE_S):
             return
         self._last_event_time = now
-        self._dispatch(fn_down)
+        self._dispatch(fn_down, ctrl_down)
 
-    def _dispatch(self, fn_down):
+    def _dispatch(self, fn_down, ctrl_down=False):
         if fn_down and not self._held:
             self._held = True
-            self._runner(lambda: _safe_call(self._on_hold_start, "on_hold_start"))
+            self._ctrl = ctrl_down
+            # Holding Control turns the press into a rewrite of the selection.
+            mode = "command" if ctrl_down else "dictation"
+            self._mode = mode
+            self._runner(lambda: _safe_call(lambda: self._on_hold_start(mode), "on_hold_start"))
+        elif fn_down and self._held:
+            if ctrl_down and not self._ctrl and self._mode == "dictation":
+                self._mode = "command"
+                if self._on_mode_change is not None:
+                    self._runner(lambda: _safe_call(
+                        lambda: self._on_mode_change("command"), "on_mode_change"))
+            self._ctrl = ctrl_down
         elif not fn_down and self._held:
             self._held = False
+            self._ctrl = ctrl_down
             self._runner(lambda: _safe_call(self._on_hold_end, "on_hold_end"))
+        else:
+            self._ctrl = ctrl_down
 
 
-def make_listener(key_name, on_hold_start, on_hold_end):
+def make_listener(key_name, on_hold_start, on_hold_end, on_mode_change=None):
     """Pick the right listener for the configured key.
 
     "fn" needs the AppKit flags-changed monitor; every other key goes through
     the pynput KEY_MAP listener.
     """
     if key_name == "fn":
-        return FnHotkeyListener(on_hold_start, on_hold_end)
+        return FnHotkeyListener(on_hold_start, on_hold_end, on_mode_change=on_mode_change)
     return HotkeyListener(key_name, on_hold_start, on_hold_end)

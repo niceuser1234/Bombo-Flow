@@ -16,6 +16,9 @@ key = "fn"
 min_duration_s = 0.3
 # Recordings are force-stopped after this many seconds.
 max_duration_s = 120
+# Hands-free recordings (double-tap fn, tap fn again to finish) stop after
+# this many seconds.
+handsfree_max_s = 600
 # Play a subtle start/stop blip when recording begins/ends.
 sounds = true
 # Which microphone to record from — a case-insensitive part of the device

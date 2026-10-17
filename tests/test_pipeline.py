@@ -18,12 +18,20 @@ from flow.pipeline import (
 class _Overlay:
     def __init__(self):
         self.prewarmed = False
+        self.styles = []
+        self.flashes = []
 
     def prewarm(self):
         self.prewarmed = True
 
-    def show(self):
-        pass
+    def show(self, style="dictation"):
+        self.styles.append(style)
+
+    def set_style(self, style):
+        self.styles.append(style)
+
+    def flash(self, message, seconds=2.0):
+        self.flashes.append((message, seconds))
 
     def hide(self):
         pass
@@ -35,6 +43,7 @@ class _Recorder:
     def __init__(self, device_name=None):
         self._recording = False
         self.stops = 0
+        self.clears = 0
         self.abandoned = 0
         self.muted_for = None
         self.device_name = device_name
@@ -54,8 +63,14 @@ class _Recorder:
         self._recording = False
         return np.zeros(100, dtype=np.float32)
 
+    def clear(self):
+        self.clears += 1
+
     def abandon(self):
         self.abandoned += 1
+
+    def rescue(self):
+        return np.zeros(0, dtype=np.float32)
 
     @property
     def level(self):
@@ -76,6 +91,7 @@ class _Config:
     cleanup_min_words = 4
     insert_mode = "paste"
     sounds = True
+    handsfree_max_s = 600.0
 
 
 class _FakeStore:
@@ -114,6 +130,13 @@ def _build_pipeline():
     pipeline._stopping = False
     pipeline._recover_timer = None
     pipeline._recovery_lock = threading.Lock()
+    pipeline._relaunch_pending = False
+    pipeline._mode = None
+    pipeline._target_app = None
+    pipeline._tap_timer = None
+    pipeline._handsfree_entry_held = False
+    pipeline._relaunched = []
+    pipeline._relaunch = lambda reason: pipeline._relaunched.append(reason)
     return pipeline
 
 
@@ -259,18 +282,21 @@ class SoundHookTests(unittest.TestCase):
 
 
 class RecorderStopTimeoutTests(unittest.TestCase):
-    def test_safe_stop_returns_zeros_on_timeout(self):
+    def test_safe_stop_reports_timeout_with_rescued_audio(self):
         pipeline = _build_pipeline()
         pipeline.recorder._recording = True
         # Make stop hang by replacing with a deadlock.
         pipeline.recorder.stop = lambda: time.sleep(999) and np.zeros(0, dtype=np.float32)
-        result = pipeline._stop_recorder_safe()
-        self.assertEqual(len(result), 0)
+        pipeline.recorder.rescue = lambda: np.full(7, 0.1, dtype=np.float32)
+        result, timed_out = pipeline._stop_recorder_safe()
+        self.assertTrue(timed_out)
+        self.assertEqual(len(result), 7)
 
     def test_safe_stop_returns_audio_on_success(self):
         pipeline = _build_pipeline()
         pipeline.recorder._recording = True
-        result = pipeline._stop_recorder_safe()
+        result, timed_out = pipeline._stop_recorder_safe()
+        self.assertFalse(timed_out)
         self.assertEqual(len(result), 100)
         self.assertFalse(pipeline.recorder.recording)
         self.assertEqual(pipeline.recorder.stops, 1)
@@ -612,14 +638,15 @@ class AudioRecoveryTests(unittest.TestCase):
         self.assertIsNot(pipeline.recorder, old)
 
     def test_timed_out_capture_does_not_reset_portaudio_or_swap(self):
-        """An empty capture means _stop_recorder_safe already timed out and
-        swapped the recorder. _finish_recording must NOT reset PortAudio (would
-        tear down the still-live abandoned stream) nor swap the recorder again."""
+        """A timed-out stop means _stop_recorder_safe already swapped the
+        recorder. _finish_recording must NOT reset PortAudio (would tear down
+        the still-live abandoned stream) nor swap the recorder again; it asks
+        for a relaunch instead of showing an error."""
         pipeline = _build_pipeline()
         pipeline.recorder._recording = True
         pipeline._press_time = time.monotonic() - 1.0  # > min_duration_s
-        # _stop_recorder_safe returns zeros(0): the timeout path.
-        pipeline._stop_recorder_safe = lambda: np.zeros(0, dtype=np.float32)
+        # (audio, timed_out): the timeout path.
+        pipeline._stop_recorder_safe = lambda: (np.zeros(0, dtype=np.float32), True)
         swapped = pipeline.recorder
         with patch("flow.pipeline.audio_mod.reset_portaudio") as reset, \
                 patch("flow.pipeline.Recorder", _Recorder), \
@@ -627,6 +654,7 @@ class AudioRecoveryTests(unittest.TestCase):
             pipeline._finish_recording()
         reset.assert_not_called()
         self.assertIs(pipeline.recorder, swapped)
+        self.assertTrue(pipeline._relaunch_pending)
 
     def test_second_failure_cancels_the_previous_recovery_timer(self):
         """Two failures inside the 2s error window left the first timer
@@ -692,3 +720,516 @@ class PersistenceOrderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _HangingRecorder(_Recorder):
+    """start()/stop() block like a wedged CoreAudio HAL."""
+
+    def __init__(self, device_name=None, hang_start=False, hang_stop=False):
+        super().__init__(device_name)
+        self._gate = threading.Event()
+        self.hang_start = hang_start
+        self.hang_stop = hang_stop
+        self.chunks_audio = np.full(16000, 0.1, dtype=np.float32)
+
+    def start(self):
+        if self.hang_start:
+            self._gate.wait(10)
+        super().start()
+
+    def stop(self):
+        if self.hang_stop:
+            self._gate.wait(10)
+        return super().stop()
+
+    def rescue(self):
+        return self.chunks_audio
+
+
+class FreezeRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.p = _build_pipeline()
+        self.p.engine = object()
+        self.queued = []
+        self.p._queue = type("_Q", (), {"put": lambda s, item: self.queued.append(item)})()
+
+    def test_hanging_start_returns_and_requests_relaunch(self):
+        self.p.recorder = _HangingRecorder(hang_start=True)
+        with patch("flow.pipeline.START_TIMEOUT_S", 0.05), patch("flow.pipeline.sound"):
+            t0 = time.monotonic()
+            self.p.on_hold_start()
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertTrue(self.p._relaunch_pending)
+        self.assertEqual(self.queued, [None])  # sentinel only — nothing to rescue
+
+    def test_hanging_stop_rescues_audio_then_relaunches(self):
+        self.p.recorder = _HangingRecorder(hang_stop=True)
+        self.p.recorder._recording = True
+        self.p._press_time = time.monotonic() - 2.0  # a real 2 s dictation
+        with patch("flow.pipeline.STOP_TIMEOUT_S", 0.05), patch("flow.pipeline.sound"):
+            self.p._finish_recording()
+        self.assertEqual(len(self.queued), 2)
+        captured, _released_at, mode, _app = self.queued[0]
+        self.assertEqual(len(captured), 16000)
+        self.assertEqual(mode, "dictation")
+        self.assertIsNone(self.queued[1])
+        self.assertTrue(self.p._relaunch_pending)
+
+    def test_presses_are_ignored_once_relaunch_is_pending(self):
+        self.p._relaunch_pending = True
+        self.p.on_hold_start()
+        self.assertFalse(self.p.recorder.recording)
+
+    def test_relaunch_waits_for_queued_dictation(self):
+        import queue as queue_mod
+
+        p = _build_pipeline()
+        p._queue = queue_mod.Queue()
+        order = []
+        p._process = lambda captured, released_at, mode="dictation", app=None: order.append("processed")
+        p._relaunch = lambda reason: order.append("relaunch")
+        p._load_model = lambda: True
+        p._queue.put((np.zeros(10, dtype=np.float32), 0.0, "dictation", None))
+        p._queue.put(None)
+        p._worker()  # returns after the sentinel
+        self.assertEqual(order, ["processed", "relaunch"])
+
+    def test_hanging_portaudio_reset_requests_relaunch_and_frees_recovery(self):
+        """Pa_Terminate blocks in exactly the wedged state recovery exists
+        for. Unbounded, the recovery lock was never released and every later
+        press was refused without a relaunch."""
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        with patch("flow.pipeline.RESET_TIMEOUT_S", 0.05), \
+                patch("flow.pipeline.audio_mod.reset_portaudio",
+                      side_effect=lambda: gate.wait(5)), \
+                patch("flow.pipeline.Recorder", _Recorder):
+            self.p._schedule_recovery()
+            _wait_for_recovery(self.p)
+        self.assertTrue(self.p._relaunch_pending)
+        self.assertEqual(self.queued, [None])
+        self.assertFalse(self.p._recovery_lock.locked())
+
+    def test_recovery_is_not_started_once_relaunch_is_pending(self):
+        self.p._relaunch_pending = True
+        with patch("flow.pipeline.audio_mod.reset_portaudio") as reset:
+            self.p._schedule_recovery()
+            _wait_for_recovery(self.p)
+        reset.assert_not_called()
+
+    def test_finish_while_relaunch_pending_queues_nothing(self):
+        """A start that returned late (after its timeout requested the
+        relaunch) leaves a live recording behind. It must not be queued
+        behind the relaunch sentinel."""
+        self.p._relaunch_pending = True
+        self.p.recorder._recording = True
+        self.p._press_time = time.monotonic() - 2.0
+        with patch("flow.pipeline.audio_mod.is_silent", return_value=False), \
+                patch("flow.pipeline.sound"):
+            self.p._finish_recording()
+        self.assertFalse(self.p.recorder.recording)
+        self.assertEqual(self.queued, [])
+
+    def test_silent_finish_while_relaunch_pending_skips_recovery(self):
+        self.p._relaunch_pending = True
+        self.p.recorder._recording = True
+        self.p._press_time = time.monotonic() - 2.0
+        with patch("flow.pipeline.audio_mod.is_silent", return_value=True), \
+                patch("flow.pipeline.audio_mod.reset_portaudio") as reset, \
+                patch.object(self.p, "_schedule_recovery") as schedule, \
+                patch("flow.pipeline.sound"):
+            self.p._finish_recording()
+        schedule.assert_not_called()
+        reset.assert_not_called()
+        self.assertEqual(self.queued, [])
+
+
+class HandsFreeTests(unittest.TestCase):
+    def setUp(self):
+        self.p = _build_pipeline()
+        self.p.engine = object()
+        self.states = []
+        self.p.set_state = self.states.append
+        self.queued = []
+        self.p._queue = type("_Q", (), {"put": lambda s, item: self.queued.append(item)})()
+        self.sound = patch("flow.pipeline.sound").start()
+        self.sound.start_duration_s.return_value = 0.2
+        self.sound.handsfree_duration_s.return_value = 0.3
+        # The fake recorder returns zeros, which the silence check would send
+        # down the recovery path instead of the queue.
+        patch("flow.pipeline.audio_mod.is_silent", return_value=False).start()
+        self.addCleanup(patch.stopall)
+        self.addCleanup(self._cancel_timers)
+
+    def _cancel_timers(self):
+        for timer in (self.p._tap_timer, self.p._max_timer):
+            if timer is not None and hasattr(timer, "cancel"):
+                timer.cancel()
+
+    def _tap(self):
+        self.p.on_hold_start("dictation")
+        self.p._press_time = time.monotonic() - 0.1  # a 0.1 s tap
+        self.p.on_hold_end()
+
+    def test_double_tap_enters_handsfree_on_same_stream(self):
+        self._tap()
+        self.p.on_hold_start("dictation")
+        self.assertEqual(self.p._mode, "handsfree")
+        self.assertEqual(self.p.recorder.stops, 0)  # stream never restarted
+        self.assertEqual(self.p.recorder.clears, 1)
+        self.assertIn("handsfree", self.states)
+        self.sound.play_handsfree.assert_called_once()
+
+    def test_release_is_ignored_in_handsfree(self):
+        self._tap()
+        self.p.on_hold_start("dictation")
+        self.p.on_hold_end()
+        self.assertTrue(self.p.recorder.recording)
+
+    def test_next_press_stops_handsfree_and_queues_it(self):
+        self._tap()
+        self.p.on_hold_start("dictation")
+        self.p._press_time = time.monotonic() - 5.0
+        self.p.on_hold_start("dictation")
+        self.assertFalse(self.p.recorder.recording)
+        self.assertEqual(self.queued[-1][2], "handsfree")
+
+    def test_single_tap_is_discarded_after_grace(self):
+        with patch("flow.pipeline.DOUBLE_TAP_S", 0.05):
+            self._tap()
+            self.assertTrue(self.p.recorder.recording)  # grace window open
+            time.sleep(0.2)
+        self.assertFalse(self.p.recorder.recording)
+        self.assertEqual(self.queued, [])
+
+    def test_long_hold_is_a_normal_dictation(self):
+        self.p.on_hold_start("dictation")
+        self.p._press_time = time.monotonic() - 2.0
+        self.p.on_hold_end()
+        self.assertEqual(self.queued[-1][2], "dictation")
+        self.assertIsNone(self.p._tap_timer)
+
+    def test_handsfree_uses_its_own_max_duration(self):
+        self._tap()
+        with patch("flow.pipeline.threading.Timer") as timer:
+            self.p.on_hold_start("dictation")
+        self.assertEqual(timer.call_args.args[0], 600.0)
+
+    def test_mode_change_turns_dictation_into_command(self):
+        self.p.on_hold_start("dictation")
+        self.p.on_mode_change("command")
+        self.assertEqual(self.p._mode, "command")
+        self.assertEqual(self.p.overlay.styles[-1], "command")
+
+    def test_mode_change_ignored_once_handsfree_is_released(self):
+        self._tap()
+        self.p.on_hold_start("dictation")
+        self.p.on_hold_end()  # hands-free dictation is now running
+        self.p.on_mode_change("command")
+        self.assertEqual(self.p._mode, "handsfree")
+
+    def test_control_during_the_handsfree_entry_hold_becomes_a_rewrite(self):
+        """Spec: holding fn+Control never triggers hands-free, in either
+        order — so fn, then Control on the second press of a double tap is
+        a rewrite."""
+        self._tap()
+        self.p.on_hold_start("dictation")  # enters hands-free, still held
+        self.p.on_mode_change("command")
+        self.assertEqual(self.p._mode, "command")
+        self.assertEqual(self.p.overlay.styles[-1], "command")
+        self.assertEqual(self.states[-1], "recording")
+        self.assertEqual(self.p._max_timer.interval, 120.0)
+        self.p._press_time = time.monotonic() - 2.0
+        self.p.on_hold_end()  # releasing ends it like any command
+        self.assertFalse(self.p.recorder.recording)
+        self.assertEqual(self.queued[-1][2], "command")
+
+    def test_command_press_never_enters_handsfree(self):
+        self._tap()
+        self.p.on_hold_start("command")  # Control held on the second press
+        self.assertNotEqual(self.p._mode, "handsfree")
+
+    # -- additions beyond the brief --
+
+    def test_command_press_in_grace_reuses_the_open_stream(self):
+        """Stopping and restarting CoreAudio back-to-back is what the tap
+        window exists to avoid; the command records on the tap's stream."""
+        self._tap()
+        old_max = self.p._max_timer
+        self.p.on_hold_start("command")
+        self.assertEqual(self.p._mode, "command")
+        self.assertIsNone(self.p._tap_timer)
+        self.assertTrue(self.p.recorder.recording)
+        self.assertEqual(self.p.recorder.stops, 0)  # stream never restarted
+        self.assertEqual(self.p.recorder.clears, 1)  # tap audio dropped
+        self.assertEqual(self.queued, [])
+        self.assertNotIn("idle", self.states)  # nothing was discarded
+        self.assertEqual(self.states[-1], "recording")
+        self.assertEqual(self.p.overlay.styles[-1], "command")
+        self.sound.play_stop.assert_not_called()
+        self.assertEqual(self.sound.play_start.call_count, 2)
+        self.assertAlmostEqual(self.p.recorder.muted_for, 0.2 + 0.05)
+        self.assertLess(time.monotonic() - self.p._press_time, 0.5)
+        self.assertIsNot(self.p._max_timer, old_max)
+        self.assertEqual(self.p._max_timer.interval, 120.0)
+
+    def test_command_press_in_grace_then_release_queues_command(self):
+        self._tap()
+        self.p.on_hold_start("command")
+        self.p._press_time = time.monotonic() - 2.0
+        self.p.on_hold_end()
+        self.assertFalse(self.p.recorder.recording)
+        self.assertEqual(self.queued[-1][2], "command")
+
+    def test_command_recording_is_queued_as_command(self):
+        self.p.on_hold_start("dictation")
+        self.p.on_mode_change("command")
+        self.p._press_time = time.monotonic() - 2.0
+        self.p.on_hold_end()
+        self.assertIsNone(self.p._tap_timer)
+        self.assertEqual(self.queued[-1][2], "command")
+        self.assertIsNone(self.p._mode)
+
+    def test_handsfree_restarts_the_max_timer(self):
+        self._tap()
+        old = self.p._max_timer
+        self.p.on_hold_start("dictation")
+        self.assertIsNot(self.p._max_timer, old)
+        self.assertFalse(old.is_alive() and not old.finished.is_set())
+        self.assertEqual(self.p._max_timer.interval, 600.0)
+
+    def test_discard_queues_nothing_and_goes_idle(self):
+        self._tap()
+        self.p._finish_recording(discard=True)
+        self.assertFalse(self.p.recorder.recording)
+        self.assertEqual(self.queued, [])
+        self.assertEqual(self.states[-1], "idle")
+        self.sound.play_stop.assert_called_once()
+        self.assertIsNone(self.p._mode)
+        self.assertIsNone(self.p._tap_timer)
+
+    def test_superseded_grace_timer_cannot_discard_handsfree(self):
+        """The grace timer can fire just as the second press switches to
+        hands-free and then wait on the lock; it must not drop the new
+        hands-free recording once it gets in."""
+        self._tap()
+        stale = self.p._tap_timer
+        self.p.on_hold_start("dictation")  # hands-free; cancels `stale`
+        self.p._finish_recording(discard=True, tap=stale)
+        self.assertTrue(self.p.recorder.recording)
+        self.assertEqual(self.p._mode, "handsfree")
+
+    def test_short_press_without_mode_finishes_immediately(self):
+        """Recordings not started through on_hold_start (no mode) keep the
+        old release-to-finish behaviour."""
+        self.p.recorder._recording = True
+        self.p._press_time = time.monotonic() - 0.1
+        self.p.on_hold_end()
+        self.assertFalse(self.p.recorder.recording)
+        self.assertIsNone(self.p._tap_timer)
+
+    def test_force_stop_finishes_handsfree(self):
+        self._tap()
+        self.p.on_hold_start("dictation")
+        self.p._press_time = time.monotonic() - 10.0
+        self.p._force_stop()
+        self.assertFalse(self.p.recorder.recording)
+        self.assertEqual(self.queued[-1][2], "handsfree")
+
+    def test_timed_out_stop_in_handsfree_queues_handsfree(self):
+        rec = _HangingRecorder(hang_stop=True)
+        self.p.recorder = rec
+        self._tap()
+        self.p.on_hold_start("dictation")
+        self.p._press_time = time.monotonic() - 3.0
+        with patch("flow.pipeline.STOP_TIMEOUT_S", 0.05), \
+                patch("flow.pipeline.Recorder", _Recorder):
+            self.p.on_hold_start("dictation")
+        rec._gate.set()
+        self.assertEqual(self.queued[0][2], "handsfree")
+        self.assertIsNone(self.queued[1])
+        self.assertTrue(self.p._relaunch_pending)
+
+
+class RewritePathTests(unittest.TestCase):
+    def setUp(self):
+        self.p = _build_pipeline()
+        self.p.engine = type("E", (), {"transcribe": lambda s, a, initial_prompt=None: "mach Stichpunkte"})()
+        self.p.cleaner = mock.Mock()
+        self.p.cleaner.available = True
+        self.p.cleaner.rewrite.return_value = "- a\n- b"
+        self.store = _FakeStore()
+        self.store.add_dictation = mock.Mock()
+        patch("flow.pipeline.get_store", return_value=self.store).start()
+        self.grab = patch("flow.pipeline.transform.grab_selection", return_value="a b").start()
+        self.insert = patch("flow.pipeline.insert_text").start()
+        patch("flow.pipeline._frontmost_app", return_value="Notes").start()
+        self.addCleanup(patch.stopall)
+
+    def _run(self):
+        self.p._process(np.zeros(16000, dtype=np.float32), time.monotonic(), "command")
+
+    def test_success_pastes_rewrite_and_records_it(self):
+        self._run()
+        self.p.cleaner.rewrite.assert_called_once_with("a b", "mach Stichpunkte")
+        self.insert.assert_called_once_with("- a\n- b", mode="paste")
+        self.assertEqual(self.store.add_dictation.call_args.kwargs["kind"], "rewrite")
+        args = self.store.add_dictation.call_args.args
+        self.assertEqual(args[0], "mach Stichpunkte")
+        self.assertEqual(args[1], "- a\n- b")
+
+    def test_grab_selection_raising_flashes_failure(self):
+        self.grab.side_effect = RuntimeError("boom")
+        self._run()
+        self.insert.assert_not_called()
+        self.assertIn(("Rewrite failed", 2.0), self.p.overlay.flashes)
+
+    def test_transcribe_raising_flashes_failure(self):
+        def boom(s, a, initial_prompt=None):
+            raise RuntimeError("boom")
+        self.p.engine = type("E", (), {"transcribe": boom})()
+        self._run()
+        self.insert.assert_not_called()
+        self.assertIn(("Rewrite failed", 2.0), self.p.overlay.flashes)
+
+    def test_no_selection_pastes_nothing(self):
+        self.grab.return_value = None
+        self._run()
+        self.insert.assert_not_called()
+        self.assertIn(("Select some text first", 2.0), self.p.overlay.flashes)
+
+    def test_failed_rewrite_pastes_nothing(self):
+        self.p.cleaner.rewrite.return_value = None
+        self._run()
+        self.insert.assert_not_called()
+        self.assertIn(("Rewrite failed", 2.0), self.p.overlay.flashes)
+
+    def test_empty_instruction_pastes_nothing(self):
+        self.p.engine = type("E", (), {"transcribe": lambda s, a, initial_prompt=None: ""})()
+        self._run()
+        self.grab.assert_not_called()
+        self.assertIn(("Didn't catch that", 2.0), self.p.overlay.flashes)
+
+    def test_no_api_key_pastes_nothing(self):
+        self.p.cleaner.available = False
+        self._run()
+        self.grab.assert_not_called()
+        self.assertIn(("Rewrite needs an API key", 2.0), self.p.overlay.flashes)
+
+    def test_newer_recording_keeps_the_overlay_on_success(self):
+        """A press while the rewrite runs owns the overlay; hiding it would
+        blank that recording's pill."""
+        self.p.recorder._recording = True
+        self.p.overlay.hide = mock.Mock()
+        self._run()
+        self.p.overlay.hide.assert_not_called()
+        self.insert.assert_called_once_with("- a\n- b", mode="paste")
+
+    def test_newer_recording_keeps_the_overlay_on_failure(self):
+        self.p.recorder._recording = True
+        self.grab.return_value = None
+        self._run()
+        self.assertEqual(self.p.overlay.flashes, [])
+
+    def test_newer_recording_keeps_the_overlay_when_rewrite_raises(self):
+        self.p.recorder._recording = True
+        self.grab.side_effect = RuntimeError("boom")
+        self._run()
+        self.assertEqual(self.p.overlay.flashes, [])
+
+    def test_dictation_mode_still_uses_cleanup_path(self):
+        self.p._process(np.zeros(16000, dtype=np.float32), time.monotonic(), "dictation")
+        self.p.cleaner.rewrite.assert_not_called()
+
+
+class _FakeRunningApp:
+    def __init__(self, name, bundle_id, path, pid=99999):
+        self._name, self._bundle_id, self._path, self._pid = name, bundle_id, path, pid
+
+    def localizedName(self):
+        return self._name
+
+    def bundleIdentifier(self):
+        return self._bundle_id
+
+    def processIdentifier(self):
+        return self._pid
+
+    def bundleURL(self):
+        if self._path is None:
+            return None
+        return type("_URL", (), {"path": lambda s, p=self._path: p})()
+
+
+class AppAttributionTests(unittest.TestCase):
+    """Desktop usage must name the app the user dictated into, the way the
+    user knows it — VS Code reports itself as "Code" — and never our own
+    window."""
+
+    def test_uses_the_finder_name_not_the_short_process_name(self):
+        from flow import pipeline
+
+        vscode = _FakeRunningApp(
+            "Code", "com.microsoft.VSCode", "/Applications/Visual Studio Code.app"
+        )
+        with patch.object(pipeline, "_finder_name", return_value="Visual Studio Code"):
+            self.assertEqual(pipeline._app_display_name(vscode), "Visual Studio Code")
+
+    def test_strips_a_visible_app_extension(self):
+        from flow import pipeline
+
+        app = _FakeRunningApp("Notes", "com.apple.Notes", "/System/Applications/Notes.app")
+        with patch.object(pipeline, "_finder_name", return_value="Notes.app"):
+            self.assertEqual(pipeline._app_display_name(app), "Notes")
+
+    def test_falls_back_to_the_process_name_without_a_bundle(self):
+        from flow import pipeline
+
+        app = _FakeRunningApp("some-tool", None, None)
+        self.assertEqual(pipeline._app_display_name(app), "some-tool")
+
+    def test_our_own_window_is_not_an_app_the_user_dictated_into(self):
+        from flow import pipeline
+
+        own = _FakeRunningApp(
+            "Bomboclat Flow", "com.bomboclat.flow", "/Applications/Bomboclat Flow.app"
+        )
+        self.assertIsNone(pipeline._app_display_name(own))
+
+    def test_our_own_process_in_dev_mode_is_excluded_too(self):
+        import os
+
+        from flow import pipeline
+
+        dev = _FakeRunningApp("Python", "org.python.python", "/x/Python.app", pid=os.getpid())
+        self.assertIsNone(pipeline._app_display_name(dev))
+
+    def test_the_app_is_taken_when_the_key_is_pressed(self):
+        """Processing takes seconds; by then the user may have switched to
+        another window (or our dashboard), which used to get the credit."""
+        p = _build_pipeline()
+        p.engine = object()
+        queued = []
+        p._queue = type("_Q", (), {"put": lambda s, item: queued.append(item)})()
+        with patch("flow.pipeline.sound"), \
+             patch("flow.pipeline.audio_mod.is_silent", return_value=False), \
+             patch("flow.pipeline._frontmost_app", return_value="Claude"):
+            p.on_hold_start("dictation")
+        p._press_time = time.monotonic() - 2.0
+        with patch("flow.pipeline.sound"), \
+             patch("flow.pipeline.audio_mod.is_silent", return_value=False), \
+             patch("flow.pipeline._frontmost_app", return_value="Bomboclat Flow"):
+            p.on_hold_end()
+        self.assertEqual(queued[-1][3], "Claude")
+
+    def test_dictation_is_stored_under_the_app_from_the_press(self):
+        p = _build_pipeline()
+        p.engine = type("E", (), {"transcribe": lambda s, a, initial_prompt=None: "hallo welt"})()
+        store = _FakeStore()
+        store.add_dictation = mock.Mock()
+        with patch("flow.pipeline.get_store", return_value=store), \
+             patch("flow.pipeline.insert_text"), \
+             patch("flow.pipeline._frontmost_app", return_value="Bomboclat Flow"):
+            p._process(np.zeros(16000, dtype=np.float32), time.monotonic(),
+                       "dictation", "Visual Studio Code")
+        self.assertEqual(store.add_dictation.call_args.kwargs["app"], "Visual Studio Code")

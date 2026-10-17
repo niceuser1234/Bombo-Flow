@@ -82,8 +82,11 @@ def main():
     _write_wav(ASSETS_DIR / "rec_start.wav", _chime([783.99, 1046.50]))
     # Lower descending E5 -> C5: "recording stopped".
     _write_wav(ASSETS_DIR / "rec_stop.wav", _chime([659.25, 523.25]))
+    # Rising G5 -> C6 -> E6: "hands-free recording — no need to hold fn".
+    _write_wav(ASSETS_DIR / "rec_handsfree.wav", _chime([783.99, 1046.50, 1318.51]))
     print(f"Wrote {ASSETS_DIR / 'rec_start.wav'}")
     print(f"Wrote {ASSETS_DIR / 'rec_stop.wav'}")
+    print(f"Wrote {ASSETS_DIR / 'rec_handsfree.wav'}")
 
 
 if __name__ == "__main__":

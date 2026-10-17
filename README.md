@@ -84,6 +84,13 @@ security add-generic-password -s whisper-flow -a openrouter -w YOUR_KEY
 
 The **AI cleanup** menu item toggles it per-session; `[cleanup] enabled` in the config sets the default. Without a key the app pastes the raw transcript (and the dictionary/auto-learning stays inactive — Parakeet itself cannot be vocabulary-biased).
 
+## Hands-free & rewrite
+
+- **Hands-free**: double-tap fn to dictate without holding the key. Tap fn once more to finish; the text is cleaned and pasted as usual. A hands-free recording stops on its own after 10 minutes (`handsfree_max_s` under `[audio]`).
+- **Rewrite**: select some text, hold **fn + Control**, say what to do with it ("make it more formal", "bullet points", "translate to English"), release — the selection is replaced with the rewritten text. **Cmd+Z** undoes it. Rewrite needs the fn hotkey and an API key (see above).
+- System Settings → Keyboard → **"Press 🌐 key to"** must be set to **"Do Nothing"**, otherwise a double-tap opens the emoji picker or dictation instead.
+- Known limitation: in VS Code with nothing selected, Cmd+C copies the whole current line, so a rewrite then inserts a rewritten copy of that line.
+
 ## Configuration
 
 Menu → **Open config**. The app reads `~/Library/Application Support/whisper-flow/config.toml` (seeded on first launch); source runs read `config.toml` in the repo. Options: hotkey (`alt_r`/`cmd_r`/`ctrl_r`/`f13`), min/max recording duration, STT engine, cleanup provider/model/timeout, insert mode (`paste` or `type` for apps that block programmatic paste).

@@ -10,9 +10,11 @@ from AppKit import (
     NSBezierPath,
     NSColor,
     NSEvent,
+    NSFont,
     NSGradient,
     NSMakeRect,
     NSScreen,
+    NSTextField,
     NSTimer,
     NSView,
     NSWindow,
@@ -66,15 +68,55 @@ def build_symmetric_waveform(
     return out
 
 
-def positioned_pill_frame(screen_frame):
+def positioned_pill_frame(screen_frame, width=PILL_WIDTH):
     """Return the canonical full-size pill frame for a screen."""
-    x = screen_frame.origin.x + (screen_frame.size.width - PILL_WIDTH) / 2.0
+    x = screen_frame.origin.x + (screen_frame.size.width - width) / 2.0
     y = screen_frame.origin.y + BOTTOM_OFFSET
-    return NSMakeRect(x, y, PILL_WIDTH, PILL_HEIGHT)
+    return NSMakeRect(x, y, width, PILL_HEIGHT)
+
+
+WIDE_PILL_WIDTH = 330.0
+HANDSFREE_PILL_WIDTH = 232.0
+LOCK_SLOT = 26.0
+STYLE_CHANGE_DURATION = 0.08
+PULSE_SPEED = 0.09  # radians per tick of the border pulse (~1 s period at 60 fps)
+
+_LAYOUTS = {
+    "dictation": {"width": PILL_WIDTH, "show_wave": True, "show_lock": False, "label": None},
+    "handsfree": {"width": HANDSFREE_PILL_WIDTH, "show_wave": True, "show_lock": True, "label": None},
+    "command": {"width": WIDE_PILL_WIDTH, "show_wave": True, "show_lock": False,
+                "label": "What should I do with it?"},
+    "message": {"width": WIDE_PILL_WIDTH, "show_wave": False, "show_lock": False, "label": ""},
+}
+
+_COLORS = {
+    # (top, bottom, border) RGBA
+    "dictation": ((0.12, 0.14, 0.20, 0.96), (0.07, 0.09, 0.13, 0.96), (0.26, 0.43, 0.58, 0.28)),
+    "handsfree": ((0.10, 0.27, 0.19, 0.96), (0.05, 0.16, 0.11, 0.96), (0.36, 0.78, 0.55, 0.55)),
+    "command": ((0.12, 0.14, 0.20, 0.96), (0.07, 0.09, 0.13, 0.96), (0.26, 0.43, 0.58, 0.28)),
+    "message": ((0.12, 0.14, 0.20, 0.96), (0.07, 0.09, 0.13, 0.96), (0.26, 0.43, 0.58, 0.28)),
+}
+
+
+def layout_for(style: str) -> dict:
+    return dict(_LAYOUTS.get(style, _LAYOUTS["dictation"]))
+
+
+def pill_colors(style: str):
+    return _COLORS.get(style, _COLORS["dictation"])
 
 
 class _PillBackgroundView(NSView):
+    def initWithFrame_(self, frame):
+        self = objc.super(_PillBackgroundView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self.style = "dictation"
+        self.pulse = 0.0
+        return self
+
     def drawRect_(self, _rect):
+        top, bottom, border = pill_colors(self.style)
         bounds = self.bounds()
         radius = bounds.size.height / 2.0
         path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
@@ -82,14 +124,18 @@ class _PillBackgroundView(NSView):
         )
         gradient = NSGradient.alloc().initWithColors_(
             [
-                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.12, 0.14, 0.20, 0.96),
-                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.07, 0.09, 0.13, 0.96),
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(*top),
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(*bottom),
             ]
         )
         gradient.drawInBezierPath_angle_(path, 90.0)
 
-        NSColor.colorWithCalibratedRed_green_blue_alpha_(0.26, 0.43, 0.58, 0.28).set()
-        path.setLineWidth_(1.0)
+        br, bg, bb, ba = border
+        handsfree = self.style == "handsfree"
+        if handsfree:
+            ba = ba * (0.55 + 0.45 * self.pulse)
+        NSColor.colorWithCalibratedRed_green_blue_alpha_(br, bg, bb, ba).set()
+        path.setLineWidth_(1.5 if handsfree else 1.0)
         path.stroke()
 
         inset = 1.0
@@ -180,6 +226,9 @@ class _TimerTarget(NSObject):
     def finishHide_(self, _timer):
         self._overlay._finish_hide_main()
 
+    def autoHide_(self, _timer):
+        self._overlay._hide_main()
+
 
 class Overlay:
     def __init__(self, level_source):
@@ -193,14 +242,27 @@ class Overlay:
         self._timer_target = None
         self._hide_timer = None
         self._phase = 0.0
+        self._pulse_phase = 0.0
+        self._style = "dictation"
+        self._label = None
+        self._lock = None
+        self._auto_hide_timer = None
 
     # -- public API (thread-safe) --
 
     def prewarm(self):
         AppHelper.callAfter(self._prewarm_main)
 
-    def show(self):
-        AppHelper.callAfter(self._show_main)
+    def show(self, style="dictation"):
+        AppHelper.callAfter(self._show_main, style)
+
+    def set_style(self, style):
+        AppHelper.callAfter(self._set_style_main, style)
+
+    def flash(self, message, seconds=2.0):
+        """Show a short status text; auto-hides after `seconds` (None = stay
+        until hide() or the next show/flash)."""
+        AppHelper.callAfter(self._flash_main, message, seconds)
 
     def hide(self):
         AppHelper.callAfter(self._hide_main)
@@ -240,15 +302,31 @@ class Overlay:
         )
         wave = _WaveformView.alloc().initWithFrame_(wave_frame)
         wave.setWantsLayer_(True)
-        wave.setAutoresizingMask_(18)
+        wave.setAutoresizingMask_(0)  # laid out explicitly per style
         content.addSubview_(wave)
+
+        label = NSTextField.labelWithString_("")
+        label.setFont_(NSFont.systemFontOfSize_weight_(13.0, 0.3))
+        label.setTextColor_(NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.92))
+        label.setAutoresizingMask_(0)
+        label.setHidden_(True)
+        content.addSubview_(label)
+
+        lock = NSTextField.labelWithString_("\U0001F512")
+        lock.setFont_(NSFont.systemFontOfSize_(14.0))
+        lock.setHidden_(True)
+        content.addSubview_(lock)
 
         self._window = window
         self._content = content
         self._pill = pill
         self._wave = wave
+        self._label = label
+        self._lock = lock
 
-    def _position_window(self):
+    def _position_window(self, width=None, animated=False):
+        if width is None:
+            width = layout_for(self._style)["width"]
         mouse = NSEvent.mouseLocation()
         screen = None
         for scr in NSScreen.screens():
@@ -257,7 +335,15 @@ class Overlay:
                 break
         if screen is None:
             screen = NSScreen.mainScreen()
-        self._window.setFrame_display_(positioned_pill_frame(screen.frame()), False)
+        frame = positioned_pill_frame(screen.frame(), width)
+        if animated:
+            # Through the animator so it supersedes an in-flight show animation.
+            NSAnimationContext.beginGrouping()
+            NSAnimationContext.currentContext().setDuration_(STYLE_CHANGE_DURATION)
+            self._window.animator().setFrame_display_(frame, True)
+            NSAnimationContext.endGrouping()
+        else:
+            self._window.setFrame_display_(frame, False)
 
     def _scaled_frame(self, frame, scale):
         scale = _clamp01(scale) if scale <= 1.0 else scale
@@ -278,8 +364,70 @@ class Overlay:
             self._position_window()
             self._window.orderOut_(None)
 
-    def _show_main(self):
+    def _is_live(self):
+        """Window is on screen and not fading out."""
+        return (
+            self._window is not None
+            and self._window.isVisible()
+            and self._hide_timer is None
+        )
+
+    def _apply_style_main(self, style, animated=False):
+        self._style = style
+        lay = layout_for(style)
+        w = lay["width"]
+        h = PILL_HEIGHT
+        m = PILL_MARGIN
+        self._pill.style = style
+        self._pill.setNeedsDisplay_(True)
+        self._position_window(w, animated)
+
+        if lay["show_lock"]:
+            self._lock.setFrame_(NSMakeRect(m + 2, (h - 18) / 2.0, 20, 18))
+        self._lock.setHidden_(not lay["show_lock"])
+
+        wave_x = m
+        if lay["show_lock"]:
+            wave_x = m + LOCK_SLOT
+        if lay["label"] is not None:
+            label_w = w * 0.58 if lay["show_wave"] else w - 2 * m - 12
+            self._label.setStringValue_(lay["label"])
+            self._label.setFrame_(NSMakeRect(m + 6, (h - 18) / 2.0, label_w, 18))
+            if lay["show_wave"]:
+                wave_x = m + w * 0.58 + 10
+        self._label.setHidden_(lay["label"] is None)
+
+        if lay["show_wave"]:
+            self._wave.setFrame_(NSMakeRect(wave_x, m, w - m - wave_x, h - 2 * m))
+        self._wave.setHidden_(not lay["show_wave"])
+
+    def _cancel_auto_hide(self):
+        if self._auto_hide_timer is not None:
+            self._auto_hide_timer.invalidate()
+            self._auto_hide_timer = None
+
+    def _set_style_main(self, style):
+        if self._window is not None and self._window.isVisible():
+            self._apply_style_main(style, animated=self._is_live())
+
+    def _flash_main(self, message, seconds):
+        self._show_main("message")
+        self._label.setStringValue_(message)
+        if seconds is not None:
+            self._auto_hide_timer = (
+                NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                    seconds, self._timer_target, b"autoHide:", None, False
+                )
+            )
+
+    def _show_main(self, style="dictation"):
         self._prewarm_main()
+        self._cancel_auto_hide()
+        if self._is_live():
+            # Already showing: restyle in place, no pop-in restart.
+            self._apply_style_main(style, animated=True)
+            return
+        self._apply_style_main(style)
         if self._hide_timer is not None:
             self._hide_timer.invalidate()
             self._hide_timer = None
@@ -298,8 +446,9 @@ class Overlay:
         self._window.animator().setFrame_display_(target_frame, False)
         NSAnimationContext.endGrouping()
 
-        if self._timer is None:
+        if self._timer_target is None:
             self._timer_target = _TimerTarget.alloc().initWithOverlay_(self)
+        if self._timer is None:
             self._timer = (
                 NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                     1.0 / FPS, self._timer_target, b"tick:", None, True
@@ -310,6 +459,7 @@ class Overlay:
         if self._window is None:
             return
         self._stop_wave_timer()
+        self._cancel_auto_hide()
         if self._hide_timer is not None:
             self._hide_timer.invalidate()
             self._hide_timer = None
@@ -347,6 +497,12 @@ class Overlay:
 
     def _on_tick(self):
         if self._wave is None:
+            return
+        if self._style == "handsfree":
+            self._pulse_phase += PULSE_SPEED
+            self._pill.pulse = 0.5 + 0.5 * math.sin(self._pulse_phase)
+            self._pill.setNeedsDisplay_(True)
+        if self._style == "message":
             return
         try:
             level = _clamp01(float(self._level_source()))

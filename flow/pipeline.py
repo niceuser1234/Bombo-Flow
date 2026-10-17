@@ -7,14 +7,17 @@ State changes are reported via a callback so the menu bar can reflect them.
 import difflib
 import functools
 import logging
+import os
 import queue
 import re
 import threading
 import time
 
 from . import audio as audio_mod
+from . import lifecycle
 from . import sound
 from . import stt
+from . import transform
 from .audio import Recorder
 from .cleanup import Cleaner
 from .insert import insert_text
@@ -27,18 +30,51 @@ log = logging.getLogger(__name__)
 # States: loading, idle, recording, processing, error
 
 STOP_TIMEOUT_S = 2.0  # max seconds to wait for recorder.stop() before giving up.
+START_TIMEOUT_S = 2.0  # max seconds to wait for recorder.start() before giving up.
+RESET_TIMEOUT_S = 3.0  # max seconds to wait for reset_portaudio() before giving up.
 # Added to the chime's own length when muting the capture: the sound travels
 # from the speakers back to the microphone, and playback starts a moment after
 # play() returns.
 CHIME_GUARD_S = 0.05
+# A tap released this recently turns the next press into hands-free.
+DOUBLE_TAP_S = 0.4
+
+
+OWN_BUNDLE_ID = "com.bomboclat.flow"
+
+
+def _finder_name(path: str) -> str | None:
+    from AppKit import NSFileManager
+
+    name = NSFileManager.defaultManager().displayNameAtPath_(path)
+    return str(name) if name else None
+
+
+def _app_display_name(app) -> str | None:
+    """The app's name as the user knows it from Finder and the Dock.
+
+    localizedName() is the process's short name, and for VS Code that is
+    "Code". Our own window never counts: dictating into the dashboard is not
+    use of another app.
+    """
+    if app is None:
+        return None
+    if app.bundleIdentifier() == OWN_BUNDLE_ID or app.processIdentifier() == os.getpid():
+        return None
+    url = app.bundleURL()
+    if url is not None:
+        name = _finder_name(url.path())
+        if name:
+            return name.removesuffix(".app")
+    name = app.localizedName()
+    return str(name) if name else None
 
 
 def _frontmost_app() -> str | None:
     try:
         from AppKit import NSWorkspace
 
-        app = NSWorkspace.sharedWorkspace().frontmostApplication()
-        return str(app.localizedName()) if app else None
+        return _app_display_name(NSWorkspace.sharedWorkspace().frontmostApplication())
     except Exception:
         return None
 
@@ -126,6 +162,22 @@ class Pipeline:
         # Held for the duration of an audio recovery. Acquired non-blocking,
         # so it doubles as the "recovery in progress" flag for on_hold_start.
         self._recovery_lock = threading.Lock()
+        # Set once CoreAudio has wedged: no new recordings, and the worker
+        # relaunches the app after finishing whatever is still queued.
+        self._relaunch_pending = False
+        self._relaunch = lifecycle.relaunch
+        # The running recording's mode: "dictation", "command" or
+        # "handsfree"; None while idle.
+        self._mode: str | None = None
+        # The app the user was in when the recording began — where the text
+        # is meant to land. Looked up at the press, not after processing,
+        # when the user may have moved on.
+        self._target_app: str | None = None
+        # Pending after a short tap: a second press inside the window turns
+        # the still-open recording into hands-free, otherwise it is dropped.
+        self._tap_timer: threading.Timer | None = None
+        # True while the press that entered hands-free is still held.
+        self._handsfree_entry_held = False
 
     def _new_recorder(self) -> Recorder:
         """Every Recorder — the initial one and each replacement built during
@@ -163,96 +215,237 @@ class Pipeline:
 
     # -- hotkey callbacks (run on the pynput listener thread) --
 
-    def on_hold_start(self):
+    def on_mode_change(self, mode):
+        """Control pressed during an fn hold: the dictation becomes a
+        rewrite-selection command. Holding fn+Control never yields
+        hands-free, so Control during the press that entered hands-free
+        turns it into a command too; once that press is released, the
+        hands-free dictation runs on and ignores Control."""
+        if mode != "command":
+            return
+        with self._lock:
+            if (not self.recorder.recording or self._stopping
+                    or self._tap_timer is not None):
+                return
+            if self._mode == "handsfree" and self._handsfree_entry_held:
+                self._handsfree_entry_held = False
+                self._mode = "command"
+                # Back to the dictation limit: a command ends on release.
+                self._restart_max_timer(self.cfg.max_duration_s)
+                self.overlay.set_style("command")
+                self.set_state("recording")
+                return
+            if self._mode != "dictation":
+                return
+            self._mode = "command"
+            self.overlay.set_style("command")
+
+    def on_hold_start(self, mode="dictation"):
         with self._lock:
             if self.engine is None:
                 return
-            if self.recorder.recording:
-                log.debug("on_hold_start skipped: already recording")
+            if (self._tap_timer is not None and self.recorder.recording
+                    and not self._stopping):
+                if mode == "dictation":
+                    self._enter_handsfree()
+                else:
+                    self._enter_command_from_tap()
                 return
-            if self._stopping:
-                log.debug("on_hold_start skipped: _finish_recording in progress")
+            if not (self.recorder.recording and not self._stopping
+                    and self._mode == "handsfree"):
+                self._start_recording(mode)
                 return
-            if self._recovery_lock.locked():
-                # Opening a stream while Pa_Terminate runs is the crash the
-                # recovery is trying to avoid in the first place.
-                log.debug("on_hold_start skipped: audio recovery in progress")
-                return
-            self._press_time = time.monotonic()
-            try:
-                self.recorder.start()
-            except Exception:
-                log.exception(
-                    "Could not start recording — resetting audio stack"
-                )
-                self._schedule_recovery()
-                return
-            if self.cfg.sounds:
-                # After the stream is open, never before: opening the input
-                # device reconfigures CoreAudio and truncates a sound that is
-                # already playing, which clips the chime's release tail. Mute
-                # the capture for its duration instead, so it still stays out
-                # of the recording. Also keeps the chime honest — it only
-                # sounds once recording has actually started.
-                self.recorder.mute_for(sound.start_duration_s() + CHIME_GUARD_S)
-                sound.play_start()
-            # A fresh recording supersedes any pending recovery reset, so
-            # cancel the stale error->idle timer before it clobbers this
-            # recording's menubar state.
-            if self._recover_timer:
-                self._recover_timer.cancel()
-                self._recover_timer = None
-            self.set_state("recording")
-            self.overlay.show()
-            self._max_timer = threading.Timer(
-                self.cfg.max_duration_s, self._force_stop
+        # _finish_recording takes the lock itself and blocks on the stop, so
+        # it runs after the lock is released.
+        self._finish_recording()
+
+    def _enter_command_from_tap(self):
+        """A command press inside the tap window: record the command on the
+        tap's still-open stream rather than stopping and restarting CoreAudio
+        back-to-back. Caller holds self._lock."""
+        self._tap_timer.cancel()
+        self._tap_timer = None
+        self.recorder.clear()
+        self._mode = "command"
+        self._press_time = time.monotonic()
+        if self.cfg.sounds:
+            self.recorder.mute_for(sound.start_duration_s() + CHIME_GUARD_S)
+            sound.play_start()
+        self.overlay.set_style("command")
+        self.set_state("recording")
+        self._restart_max_timer(self.cfg.max_duration_s)
+
+    def _enter_handsfree(self):
+        """Second press of a double tap: keep the open stream, drop the tap's
+        audio, and record until the next press. Caller holds self._lock."""
+        self._tap_timer.cancel()
+        self._tap_timer = None
+        self._mode = "handsfree"
+        # Until this press is released, Control still makes it a command.
+        self._handsfree_entry_held = True
+        self.recorder.clear()
+        self._press_time = time.monotonic()
+        if self.cfg.sounds:
+            self.recorder.mute_for(sound.handsfree_duration_s() + CHIME_GUARD_S)
+            sound.play_handsfree()
+        self.overlay.set_style("handsfree")
+        self.set_state("handsfree")
+        # The dictation limit must not cut a hands-free recording short.
+        self._restart_max_timer(self.cfg.handsfree_max_s)
+
+    def _restart_max_timer(self, seconds):
+        """Replace the running max-duration timer. Caller holds self._lock."""
+        if self._max_timer:
+            self._max_timer.cancel()
+        self._max_timer = threading.Timer(seconds, self._force_stop)
+        self._max_timer.daemon = True
+        self._max_timer.start()
+
+    def _start_recording(self, mode):
+        """Open the stream for a new press. Caller holds self._lock."""
+        if self._relaunch_pending:
+            log.debug("on_hold_start skipped: relaunch pending")
+            return
+        if self.recorder.recording:
+            log.debug("on_hold_start skipped: already recording")
+            return
+        if self._stopping:
+            log.debug("on_hold_start skipped: _finish_recording in progress")
+            return
+        if self._recovery_lock.locked():
+            # Opening a stream while Pa_Terminate runs is the crash the
+            # recovery is trying to avoid in the first place.
+            log.debug("on_hold_start skipped: audio recovery in progress")
+            return
+        self._press_time = time.monotonic()
+        self._target_app = _frontmost_app()
+        finished, _, error = self._run_bounded(
+            self.recorder.start, START_TIMEOUT_S, "recorder-start"
+        )
+        if not finished:
+            log.warning(
+                "recorder.start() did not return within %.1fs — CoreAudio "
+                "is wedged", START_TIMEOUT_S,
             )
-            self._max_timer.daemon = True
-            self._max_timer.start()
+            self._request_relaunch("recorder.start() hung")
+            return
+        if error is not None:
+            log.error(
+                "Could not start recording — resetting audio stack",
+                exc_info=error,
+            )
+            self._schedule_recovery()
+            return
+        self._mode = mode
+        if self.cfg.sounds:
+            # After the stream is open, never before: opening the input
+            # device reconfigures CoreAudio and truncates a sound that is
+            # already playing, which clips the chime's release tail. Mute
+            # the capture for its duration instead, so it still stays out
+            # of the recording. Also keeps the chime honest — it only
+            # sounds once recording has actually started.
+            self.recorder.mute_for(sound.start_duration_s() + CHIME_GUARD_S)
+            sound.play_start()
+        # A fresh recording supersedes any pending recovery reset, so
+        # cancel the stale error->idle timer before it clobbers this
+        # recording's menubar state.
+        if self._recover_timer:
+            self._recover_timer.cancel()
+            self._recover_timer = None
+        self.set_state("recording")
+        self.overlay.show(style=mode)
+        self._max_timer = threading.Timer(
+            self.cfg.max_duration_s, self._force_stop
+        )
+        self._max_timer.daemon = True
+        self._max_timer.start()
 
     def on_hold_end(self):
+        with self._lock:
+            if not self.recorder.recording or self._stopping:
+                return
+            # Hands-free ends on the next press, not on a release; and a
+            # release while the tap window is open belongs to the tap.
+            if self._mode == "handsfree":
+                self._handsfree_entry_held = False
+                return
+            if self._tap_timer is not None:
+                return
+            held = time.monotonic() - self._press_time
+            if self._mode == "dictation" and held < self.cfg.min_duration_s:
+                # Too short to dictate: keep the stream open in case this is
+                # the first half of a double tap.
+                self._tap_timer = threading.Timer(
+                    DOUBLE_TAP_S, self._tap_grace_expired
+                )
+                self._tap_timer.daemon = True
+                self._tap_timer.start()
+                return
         self._finish_recording()
+
+    def _tap_grace_expired(self):
+        # Hands the timer itself in, so a timer that fired just as a second
+        # press switched to hands-free cannot discard that recording.
+        self._finish_recording(discard=True, tap=threading.current_thread())
 
     def _force_stop(self):
         log.warning("Max recording duration reached — stopping")
         self._finish_recording()
 
-    def _finish_recording(self):
+    def _finish_recording(self, discard=False, tap=None):
         with self._lock:
+            if tap is not None and tap is not self._tap_timer:
+                return  # a superseded tap-grace timer
             if not self.recorder.recording or self._stopping:
                 return
             self._stopping = True
+            if self._tap_timer is not None:
+                if self._tap_timer is not threading.current_thread():
+                    self._tap_timer.cancel()
+                self._tap_timer = None
             if self._max_timer:
                 self._max_timer.cancel()
                 self._max_timer = None
             duration = time.monotonic() - self._press_time
+            mode = self._mode or "dictation"
+            app = self._target_app
         # _stopping stays True until the tail below finishes, so a fast
         # re-press cannot start a recording whose state/overlay this old
         # press would then stomp. The blocking stop still runs lock-free.
         try:
-            captured = self._stop_recorder_safe()
+            captured, timed_out = self._stop_recorder_safe()
             if self.cfg.sounds:
                 sound.play_stop()
 
-            self.overlay.hide()
-            if duration < self.cfg.min_duration_s:
+            if timed_out:
+                self.overlay.hide()
+                if (not discard and duration >= self.cfg.min_duration_s
+                        and len(captured)
+                        and not audio_mod.is_silent(captured)):
+                    self.set_state("processing")
+                    self._queue.put((captured, time.monotonic(), mode, app))
+                self._request_relaunch("recorder.stop() hung")
+                return
+            if self._relaunch_pending:
+                # E.g. a start that returned after its timeout already asked
+                # for the relaunch. Anything queued now would sit behind the
+                # relaunch sentinel, and a recovery would race it. The state
+                # stays "loading" until the app restarts.
+                self.overlay.hide()
+                log.info("Discarding recording: relaunch pending")
+                return
+            if discard or duration < self.cfg.min_duration_s:
+                self.overlay.hide()
                 log.info("Discarding %.2fs tap", duration)
                 self.set_state("idle")
                 return
             if len(captured) == 0:
-                # Empty capture means _stop_recorder_safe timed out and has
-                # ALREADY abandoned the wedged stream and swapped in a fresh
-                # Recorder. Do NOT reset PortAudio here: sd._terminate() while
-                # the abandoned CoreAudio stream is still live in the wedged
-                # HAL thread can crash. Just surface the error and recover UI.
-                log.warning(
-                    "recorder.stop() timed out — recorder already rebuilt; "
-                    "skipping PortAudio reset to avoid tearing down the "
-                    "abandoned stream"
-                )
+                self.overlay.hide()
+                log.warning("recorder.stop() returned no audio")
                 self._enter_error_then_idle()
                 return
             if audio_mod.is_silent(captured):
+                self.overlay.hide()
                 log.warning(
                     "Recording is silent — resetting audio stack (stale "
                     "input device?). If this repeats, check Microphone "
@@ -260,10 +453,17 @@ class Pipeline:
                 )
                 self._schedule_recovery()
                 return
+            if mode == "command":
+                self.overlay.flash("Rewriting…", seconds=None)
+            else:
+                self.overlay.hide()
             self.set_state("processing")
-            self._queue.put((captured, time.monotonic()))
+            self._queue.put((captured, time.monotonic(), mode, app))
         finally:
             with self._lock:
+                self._mode = None
+                self._target_app = None
+                self._handsfree_entry_held = False
                 self._stopping = False
 
     def _schedule_recovery(self):
@@ -276,6 +476,11 @@ class Pipeline:
         inline would stall every further press and release behind it — the
         app would stop responding to the hotkey altogether.
         """
+        if self._relaunch_pending:
+            # A relaunch replaces the whole audio stack anyway; touching
+            # PortAudio now would only race the wedged stream.
+            log.debug("Audio recovery skipped: relaunch pending")
+            return
         if not self._recovery_lock.acquire(blocking=False):
             log.debug("Audio recovery already in progress")
             return
@@ -306,7 +511,20 @@ class Pipeline:
             )
             stale.abandon()
         else:
-            audio_mod.reset_portaudio()
+            # Bounded like start/stop: a blocked Pa_Terminate would otherwise
+            # hold _recovery_lock forever, refusing every later press.
+            finished, _, error = self._run_bounded(
+                audio_mod.reset_portaudio, RESET_TIMEOUT_S, "portaudio-reset"
+            )
+            if not finished:
+                log.warning(
+                    "reset_portaudio() did not return within %.1fs — "
+                    "CoreAudio is wedged", RESET_TIMEOUT_S,
+                )
+                self._request_relaunch("reset_portaudio() hung")
+                return
+            if error is not None:
+                raise error
         self.recorder = self._new_recorder()
         self._enter_error_then_idle()
 
@@ -324,47 +542,65 @@ class Pipeline:
         self._recover_timer.daemon = True
         self._recover_timer.start()
 
-    def _stop_recorder_safe(self) -> "np.ndarray":
-        """Stop the recorder off the calling thread, with a hard timeout.
-
-        CoreAudio can wedge inside AudioDeviceStop (its IO thread and the
-        stopping thread deadlock over the HAL locks). The stop therefore runs
-        on a throwaway thread: if it does not return in time we abandon that
-        thread along with its stream and swap in a fresh Recorder, so the next
-        dictation still works instead of finding `recording` stuck at True.
-
-        Returns the captured audio array, or zeros when the stop timed out.
-        """
-        import numpy as np
-
-        result: list[np.ndarray] = []
+    def _run_bounded(self, func, timeout, name):
+        """Run func() on a throwaway thread. Returns (finished, result, error).
+        A wedged CoreAudio call leaves its thread behind — daemon, harmless."""
+        box: dict = {}
         done = threading.Event()
-        stuck = self.recorder
 
-        def _stop():
+        def _run():
             try:
-                result.append(stuck.stop())
-            except Exception:
-                log.exception("recorder.stop() raised")
+                box["result"] = func()
+            except BaseException as e:  # re-raised by the caller
+                box["error"] = e
             finally:
                 done.set()
 
-        stopper = threading.Thread(target=_stop, daemon=True, name="recorder-stop")
-        stopper.start()
-        if not done.wait(STOP_TIMEOUT_S):
+        threading.Thread(target=_run, daemon=True, name=name).start()
+        if not done.wait(timeout):
+            return False, None, None
+        return True, box.get("result"), box.get("error")
+
+    def _stop_recorder_safe(self) -> "tuple[np.ndarray, bool]":
+        """Stop the recorder off the calling thread, with a hard timeout.
+
+        CoreAudio can wedge inside AudioDeviceStop (its IO thread and the
+        stopping thread deadlock over the HAL locks). On timeout the audio
+        captured so far is rescued, the stream abandoned, and a fresh
+        Recorder swapped in. Returns (audio, timed_out).
+        """
+        import numpy as np
+
+        stuck = self.recorder
+        finished, result, error = self._run_bounded(
+            stuck.stop, STOP_TIMEOUT_S, "recorder-stop"
+        )
+        if not finished:
             log.warning(
                 "recorder.stop() did not return within %.1fs — CoreAudio is "
-                "stalled; abandoning the stream and rebuilding the recorder",
+                "stalled; rescuing the captured audio and abandoning the stream",
                 STOP_TIMEOUT_S,
             )
+            rescued = stuck.rescue()
             stuck.abandon()
             # The overlay's level_source closes over `self`, so it follows the
             # swap without further wiring.
             self.recorder = self._new_recorder()
-            return np.zeros(0, dtype=np.float32)
-        if result:
-            return result[0]
-        return np.zeros(0, dtype=np.float32)
+            return rescued, True
+        if error is not None:
+            log.error("recorder.stop() raised", exc_info=error)
+            return np.zeros(0, dtype=np.float32), False
+        return result, False
+
+    def _request_relaunch(self, reason: str):
+        """CoreAudio is wedged for the rest of this process. Stop taking new
+        recordings; the worker relaunches once the queue ahead is drained."""
+        if self._relaunch_pending:
+            return
+        self._relaunch_pending = True
+        self.set_state("loading")
+        self._queue.put(None)
+        log.warning("Relaunch scheduled: %s", reason)
 
     # -- worker --
 
@@ -372,9 +608,13 @@ class Pipeline:
         if not self._load_model():
             return
         while True:
-            captured, released_at = self._queue.get()
+            item = self._queue.get()
+            if item is None:
+                self._relaunch("CoreAudio wedged")
+                return
+            captured, released_at, mode, app = item
             try:
-                self._process(captured, released_at)
+                self._process(captured, released_at, mode, app)
             except Exception:
                 log.exception("Pipeline processing failed")
                 self.set_state("error")
@@ -383,7 +623,64 @@ class Pipeline:
                 if self._queue.empty() and not self.recorder.recording:
                     self.set_state("idle")
 
-    def _process(self, captured, released_at):
+    def _process_rewrite(self, captured, released_at, app=None):
+        """Rewrite mode: the recording is an instruction for the selection.
+
+        Never raises: the "Rewriting…" pill is persistent, so any failure must
+        replace it with a message rather than leave it on screen.
+        """
+        try:
+            self._rewrite(captured, released_at, app)
+        except Exception:
+            log.exception("Rewrite failed")
+            self._rewrite_feedback("Rewrite failed")
+
+    def _rewrite_feedback(self, message=None):
+        """Replace the "Rewriting…" pill with a message, or hide it. A
+        recording started meanwhile owns the overlay, so leave it alone."""
+        if self.recorder.recording:
+            return
+        if message is None:
+            self.overlay.hide()
+        else:
+            self.overlay.flash(message, 2.0)
+
+    def _rewrite(self, captured, released_at, app=None):
+        instruction = self.engine.transcribe(captured).strip()
+        log.info("Rewrite instruction (%.2fs): %d chars",
+                 time.monotonic() - released_at, len(instruction))
+        if len(instruction) < 2:
+            self._rewrite_feedback("Didn't catch that")
+            return
+        if not self.cleaner.available:
+            self._rewrite_feedback("Rewrite needs an API key")
+            return
+        selection = transform.grab_selection()
+        if not selection:
+            self._rewrite_feedback("Select some text first")
+            return
+        result = self.cleaner.rewrite(selection, instruction)
+        if not result:
+            self._rewrite_feedback("Rewrite failed")
+            return
+        self._rewrite_feedback()
+        try:
+            get_store().add_dictation(
+                instruction, result,
+                duration_s=len(captured) / self.recorder.samplerate,
+                app=app, corrected_words=0, dict_fixes=0,
+                kind="rewrite",
+            )
+        except Exception:
+            log.exception("Storing rewrite failed")
+        insert_text(result, mode=self.cfg.insert_mode)
+        log.info("Rewrote %d -> %d chars after %.2fs total",
+                 len(selection), len(result), time.monotonic() - released_at)
+
+    def _process(self, captured, released_at, mode="dictation", app=None):
+        if mode == "command":
+            self._process_rewrite(captured, released_at, app)
+            return
         store = get_store()
         # Two lists on purpose: the cleanup LLM sees the whole dictionary (it
         # has the surrounding text and is told not to insert unspoken terms),
@@ -407,7 +704,6 @@ class Pipeline:
             log.info("Cleaned (%.2fs): %d chars",
                      time.monotonic() - t_stt, len(text))
             log.debug("Cleaned text: %r", text)
-        app_name = _frontmost_app()
         # Persist before inserting. Insertion is the step that can fail for
         # reasons outside our control (wedged main thread, refused pasteboard),
         # and a transcript that only exists in the history is recoverable —
@@ -417,7 +713,7 @@ class Pipeline:
             store.add_dictation(
                 raw, text,
                 duration_s=len(captured) / self.recorder.samplerate,
-                app=app_name,
+                app=app,
                 corrected_words=_words_changed(raw, text),
                 dict_fixes=_dict_fixes(vocabulary, raw, text),
             )

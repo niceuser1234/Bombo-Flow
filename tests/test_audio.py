@@ -215,3 +215,16 @@ class ResetPortaudioTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_rescue_returns_captured_audio_without_touching_the_stream():
+    rec = audio.Recorder()
+    rec._chunks = [np.ones((4, 1), dtype=np.float32), np.zeros((2, 1), dtype=np.float32)]
+    out = rec.rescue()
+    assert out.shape == (6,)
+    assert out[:4].tolist() == [1.0] * 4
+    assert rec._chunks, "rescue must not clear chunks — abandon() does that"
+
+
+def test_rescue_of_empty_recorder_is_empty():
+    assert len(audio.Recorder().rescue()) == 0
