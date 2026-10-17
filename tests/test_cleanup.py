@@ -295,5 +295,38 @@ def test_rewrite_without_key_returns_none():
     assert c.rewrite("a b", "x") is None
 
 
+def _anthropic_rewrite_cleaner(stop_reason="end_turn"):
+    from types import SimpleNamespace as NS
+    from flow import cleanup
+    c = cleanup.Cleaner.__new__(cleanup.Cleaner)
+    c.cfg = NS(cleanup_model="m")
+    c.provider = "anthropic"
+    c._api_key = None
+    kwargs = {}
+
+    def create(**kw):
+        kwargs.update(kw)
+        return NS(stop_reason=stop_reason, content=[
+            NS(type="text", text="- a\n"), NS(type="tool_use", text="x"),
+            NS(type="text", text="- b")])
+
+    c._client = NS(messages=NS(create=create))
+    return c, kwargs
+
+
+def test_rewrite_anthropic_joins_text_blocks_and_passes_limits():
+    from flow import cleanup
+    c, kw = _anthropic_rewrite_cleaner()
+    assert c.rewrite("a b", "bullet points") == "- a\n- b"
+    assert kw["timeout"] == cleanup.REWRITE_TIMEOUT_S
+    assert kw["max_tokens"] == 4096
+    assert kw["system"] == cleanup.REWRITE_PROMPT
+
+
+def test_rewrite_anthropic_max_tokens_returns_none():
+    c, _ = _anthropic_rewrite_cleaner(stop_reason="max_tokens")
+    assert c.rewrite("a b", "bullet points") is None
+
+
 if __name__ == "__main__":
     unittest.main()
