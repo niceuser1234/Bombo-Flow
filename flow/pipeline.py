@@ -142,6 +142,8 @@ class Pipeline:
         # Pending after a short tap: a second press inside the window turns
         # the still-open recording into hands-free, otherwise it is dropped.
         self._tap_timer: threading.Timer | None = None
+        # True while the press that entered hands-free is still held.
+        self._handsfree_entry_held = False
 
     def _new_recorder(self) -> Recorder:
         """Every Recorder — the initial one and each replacement built during
@@ -181,13 +183,25 @@ class Pipeline:
 
     def on_mode_change(self, mode):
         """Control pressed during an fn hold: the dictation becomes a
-        rewrite-selection command. Hands-free never changes mode."""
+        rewrite-selection command. Holding fn+Control never yields
+        hands-free, so Control during the press that entered hands-free
+        turns it into a command too; once that press is released, the
+        hands-free dictation runs on and ignores Control."""
         if mode != "command":
             return
         with self._lock:
             if (not self.recorder.recording or self._stopping
-                    or self._tap_timer is not None
-                    or self._mode != "dictation"):
+                    or self._tap_timer is not None):
+                return
+            if self._mode == "handsfree" and self._handsfree_entry_held:
+                self._handsfree_entry_held = False
+                self._mode = "command"
+                # Back to the dictation limit: a command ends on release.
+                self._restart_max_timer(self.cfg.max_duration_s)
+                self.overlay.set_style("command")
+                self.set_state("recording")
+                return
+            if self._mode != "dictation":
                 return
             self._mode = "command"
             self.overlay.set_style("command")
@@ -227,6 +241,8 @@ class Pipeline:
         self._tap_timer.cancel()
         self._tap_timer = None
         self._mode = "handsfree"
+        # Until this press is released, Control still makes it a command.
+        self._handsfree_entry_held = True
         self.recorder.clear()
         self._press_time = time.monotonic()
         if self.cfg.sounds:
@@ -235,11 +251,13 @@ class Pipeline:
         self.overlay.set_style("handsfree")
         self.set_state("handsfree")
         # The dictation limit must not cut a hands-free recording short.
+        self._restart_max_timer(self.cfg.handsfree_max_s)
+
+    def _restart_max_timer(self, seconds):
+        """Replace the running max-duration timer. Caller holds self._lock."""
         if self._max_timer:
             self._max_timer.cancel()
-        self._max_timer = threading.Timer(
-            self.cfg.handsfree_max_s, self._force_stop
-        )
+        self._max_timer = threading.Timer(seconds, self._force_stop)
         self._max_timer.daemon = True
         self._max_timer.start()
 
@@ -307,7 +325,10 @@ class Pipeline:
                 return
             # Hands-free ends on the next press, not on a release; and a
             # release while the tap window is open belongs to the tap.
-            if self._mode == "handsfree" or self._tap_timer is not None:
+            if self._mode == "handsfree":
+                self._handsfree_entry_held = False
+                return
+            if self._tap_timer is not None:
                 return
             held = time.monotonic() - self._press_time
             if self._mode == "dictation" and held < self.cfg.min_duration_s:
@@ -399,6 +420,7 @@ class Pipeline:
         finally:
             with self._lock:
                 self._mode = None
+                self._handsfree_entry_held = False
                 self._stopping = False
 
     def _schedule_recovery(self):

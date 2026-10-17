@@ -133,6 +133,7 @@ def _build_pipeline():
     pipeline._relaunch_pending = False
     pipeline._mode = None
     pipeline._tap_timer = None
+    pipeline._handsfree_entry_held = False
     pipeline._relaunched = []
     pipeline._relaunch = lambda reason: pipeline._relaunched.append(reason)
     return pipeline
@@ -919,11 +920,28 @@ class HandsFreeTests(unittest.TestCase):
         self.assertEqual(self.p._mode, "command")
         self.assertEqual(self.p.overlay.styles[-1], "command")
 
-    def test_mode_change_ignored_in_handsfree(self):
+    def test_mode_change_ignored_once_handsfree_is_released(self):
         self._tap()
         self.p.on_hold_start("dictation")
+        self.p.on_hold_end()  # hands-free dictation is now running
         self.p.on_mode_change("command")
         self.assertEqual(self.p._mode, "handsfree")
+
+    def test_control_during_the_handsfree_entry_hold_becomes_a_rewrite(self):
+        """Spec: holding fn+Control never triggers hands-free, in either
+        order — so fn, then Control on the second press of a double tap is
+        a rewrite."""
+        self._tap()
+        self.p.on_hold_start("dictation")  # enters hands-free, still held
+        self.p.on_mode_change("command")
+        self.assertEqual(self.p._mode, "command")
+        self.assertEqual(self.p.overlay.styles[-1], "command")
+        self.assertEqual(self.states[-1], "recording")
+        self.assertEqual(self.p._max_timer.interval, 120.0)
+        self.p._press_time = time.monotonic() - 2.0
+        self.p.on_hold_end()  # releasing ends it like any command
+        self.assertFalse(self.p.recorder.recording)
+        self.assertEqual(self.queued[-1][2], "command")
 
     def test_command_press_never_enters_handsfree(self):
         self._tap()
