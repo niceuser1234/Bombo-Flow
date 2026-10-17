@@ -216,13 +216,17 @@ def _schedule_clipboard_repair(saved: dict) -> None:
     AppHelper.callAfter(repair)
 
 
-def _post_cmd_v():
+def _post_cmd_key(keycode: int):
     src = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
     for down in (True, False):
-        ev = Quartz.CGEventCreateKeyboardEvent(src, _KEYCODE_V, down)
+        ev = Quartz.CGEventCreateKeyboardEvent(src, keycode, down)
         Quartz.CGEventSetFlags(ev, Quartz.kCGEventFlagMaskCommand)
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
         time.sleep(0.01)
+
+
+def _post_cmd_v():
+    _post_cmd_key(_KEYCODE_V)
 
 
 def _utf16_len(text: str) -> int:

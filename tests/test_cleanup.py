@@ -246,5 +246,54 @@ class ListFormattingPromptTests(unittest.TestCase):
         self.assertIn("NEVER be reformatted", SYSTEM_PROMPT)
 
 
+def _rewrite_cleaner(response=None, exc=None):
+    from flow import cleanup
+    c = cleanup.Cleaner.__new__(cleanup.Cleaner)
+    c.cfg = type("C", (), {"cleanup_model": "m", "cleanup_base_url": "https://x/api/v1",
+                           "cleanup_timeout_s": 5.0})()
+    c.provider = "openrouter"
+    c._client = None
+    c._api_key = "k"
+    calls = []
+
+    def post(body, timeout=None):
+        calls.append((body, timeout))
+        if exc:
+            raise exc
+        return response
+
+    c._post_openai = post
+    return c, calls
+
+
+def test_rewrite_returns_model_text_with_long_timeout():
+    from flow import cleanup
+    c, calls = _rewrite_cleaner({"choices": [{"finish_reason": "stop",
+                                              "message": {"content": "- a\n- b"}}]})
+    assert c.rewrite("a b", "bullet points") == "- a\n- b"
+    body, timeout = calls[0]
+    assert timeout == cleanup.REWRITE_TIMEOUT_S
+    assert body["messages"][0]["content"] == cleanup.REWRITE_PROMPT
+    assert "bullet points" in body["messages"][1]["content"]
+    assert "response_format" not in body
+
+
+def test_rewrite_truncated_returns_none():
+    c, _ = _rewrite_cleaner({"choices": [{"finish_reason": "length",
+                                          "message": {"content": "- a"}}]})
+    assert c.rewrite("a b", "bullet points") is None
+
+
+def test_rewrite_failure_returns_none():
+    c, _ = _rewrite_cleaner(exc=TimeoutError("slow"))
+    assert c.rewrite("a b", "bullet points") is None
+
+
+def test_rewrite_without_key_returns_none():
+    c, _ = _rewrite_cleaner()
+    c._api_key = None
+    assert c.rewrite("a b", "x") is None
+
+
 if __name__ == "__main__":
     unittest.main()

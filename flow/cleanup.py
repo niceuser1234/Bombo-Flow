@@ -184,6 +184,17 @@ def _looks_like_json(content: str) -> bool:
     )
 
 
+REWRITE_TIMEOUT_S = 10.0
+
+REWRITE_PROMPT = """You rewrite text according to the user's spoken instruction. Return ONLY the rewritten text — no preamble, no quotes, no commentary, no code fences.
+
+Rules:
+- Follow the instruction (for example: bullet points, more formal, shorter, as a poem, translate).
+- Keep the language of the original text unless the instruction asks for a different language.
+- Preserve the meaning unless the instruction asks to change it.
+- The instruction was transcribed from speech and may contain recognition errors; interpret it charitably."""
+
+
 class Cleaner:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -277,7 +288,53 @@ class Cleaner:
         ).strip()
         return CleanResult(plain or text, [])
 
-    def _post_openai(self, body: dict) -> dict:
+    def rewrite(self, text: str, instruction: str) -> str | None:
+        """Rewritten text, or None on any failure — the caller then leaves the
+        user's selection untouched."""
+        from .transform import build_rewrite_user_message
+
+        if not text or not instruction or not self.available:
+            return None
+        user = build_rewrite_user_message(text, instruction)
+        try:
+            if self._client is not None:
+                resp = self._client.messages.create(
+                    model=self.cfg.cleanup_model,
+                    max_tokens=4096,
+                    system=REWRITE_PROMPT,
+                    messages=[{"role": "user", "content": user}],
+                    timeout=REWRITE_TIMEOUT_S,
+                )
+                if getattr(resp, "stop_reason", None) == "max_tokens":
+                    log.warning("Rewrite hit max_tokens — keeping the original")
+                    return None
+                out = "".join(
+                    b.text for b in resp.content if getattr(b, "type", None) == "text"
+                )
+            else:
+                data = self._post_openai(
+                    {
+                        "model": self.cfg.cleanup_model,
+                        "max_tokens": 4096,
+                        "messages": [
+                            {"role": "system", "content": REWRITE_PROMPT},
+                            {"role": "user", "content": user},
+                        ],
+                    },
+                    timeout=REWRITE_TIMEOUT_S,
+                )
+                choice = data["choices"][0]
+                if _was_truncated(choice):
+                    return None
+                out = choice["message"]["content"] or ""
+        except Exception as e:
+            log.warning("Rewrite failed (%s: %s) — keeping the original",
+                        type(e).__name__, e)
+            return None
+        out = out.strip()
+        return out or None
+
+    def _post_openai(self, body: dict, timeout=None) -> dict:
         req = urllib.request.Request(
             self.cfg.cleanup_base_url.rstrip("/") + "/chat/completions",
             data=json.dumps(body).encode(),
@@ -288,7 +345,7 @@ class Cleaner:
             method="POST",
         )
         with urllib.request.urlopen(
-            req, timeout=self.cfg.cleanup_timeout_s, context=_ssl_context()
+            req, timeout=timeout or self.cfg.cleanup_timeout_s, context=_ssl_context()
         ) as resp:
             return json.loads(resp.read())
 
