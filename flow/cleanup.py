@@ -231,12 +231,22 @@ class Cleaner:
         """Return a CleanResult, or the raw text (new_terms=[]) on any failure."""
         if not text or not self.available:
             return CleanResult(text, [])
-        if len(text.split()) < self.cfg.cleanup_min_words:
+        words = len(text.split())
+        if words < self.cfg.cleanup_min_words:
             return CleanResult(text, [])
+        # A long hands-free dictation outgrows the fixed limits: the reply
+        # would be cut off (and the raw transcript pasted) or time out.
+        # Up to ~120 words / ~800 words these stay at their old values.
+        timeout = max(self.cfg.cleanup_timeout_s, 3.0 + words / 60.0)
+        max_tokens = min(8192, max(2048, int(words * 2.5)))
         try:
             if self._client is not None:
-                return self._clean_anthropic(text, vocabulary)
-            return self._clean_openai_compatible(text, vocabulary)
+                return self._clean_anthropic(
+                    text, vocabulary, timeout=timeout, max_tokens=max_tokens
+                )
+            return self._clean_openai_compatible(
+                text, vocabulary, timeout=timeout, max_tokens=max_tokens
+            )
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:500]
             log.warning("Cleanup HTTP %s — using raw transcript: %s",
@@ -247,15 +257,17 @@ class Cleaner:
                         type(e).__name__, e)
             return CleanResult(text, [])
 
-    def _clean_anthropic(self, text: str, vocabulary=None) -> CleanResult:
+    def _clean_anthropic(self, text: str, vocabulary=None, timeout=None,
+                         max_tokens=2048) -> CleanResult:
         system = _build_system_prompt(vocabulary, want_terms=True)
         resp = self._client.messages.create(
             model=self.cfg.cleanup_model,
-            max_tokens=2048,
+            max_tokens=max_tokens,
             system=system,
             messages=[{"role": "user", "content": text}],
             tools=[_ANTHROPIC_TOOL],
             tool_choice={"type": "tool", "name": "submit_cleanup"},
+            timeout=timeout or self.cfg.cleanup_timeout_s,
         )
         return self._parse_anthropic_response(resp, text)
 
@@ -349,10 +361,12 @@ class Cleaner:
         ) as resp:
             return json.loads(resp.read())
 
-    def _clean_openai_compatible(self, text: str, vocabulary=None) -> CleanResult:
+    def _clean_openai_compatible(self, text: str, vocabulary=None, timeout=None,
+                                 max_tokens=2048) -> CleanResult:
+        timeout = timeout or self.cfg.cleanup_timeout_s
         base_body = {
             "model": self.cfg.cleanup_model,
-            "max_tokens": 2048,
+            "max_tokens": max_tokens,
             "messages": [
                 {"role": "system",
                  "content": _build_system_prompt(vocabulary, want_terms=True)},
@@ -361,7 +375,8 @@ class Cleaner:
         }
         try:
             data = self._post_openai({**base_body,
-                                      "response_format": _RESPONSE_FORMAT})
+                                      "response_format": _RESPONSE_FORMAT},
+                                     timeout=timeout)
         except urllib.error.HTTPError as e:
             # A 400 typically means the provider rejected response_format.
             # Retry once as a plain (unstructured) request, no term detection.
@@ -376,7 +391,7 @@ class Cleaner:
                  "content": _build_system_prompt(vocabulary, want_terms=False)},
                 {"role": "user", "content": text},
             ]
-            data = self._post_openai(plain_body)
+            data = self._post_openai(plain_body, timeout=timeout)
             choice = data["choices"][0]
             if _was_truncated(choice):
                 return CleanResult(text, [])

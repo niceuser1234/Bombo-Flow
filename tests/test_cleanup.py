@@ -120,6 +120,91 @@ class AnthropicParseTests(unittest.TestCase):
         self.assertEqual(result.new_terms, [])
 
 
+class LongDictationLimitTests(unittest.TestCase):
+    """A 10-minute hands-free dictation needs more than 2048 output tokens
+    and more than the 5 s cleanup timeout; with the fixed limits it was
+    silently pasted raw. Short dictations keep the old limits."""
+
+    SHORT = "some raw transcript text here"
+    LONG = " ".join(["wort"] * 1200)
+
+    def _anthropic(self):
+        captured = {}
+
+        class _Messages:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return _Resp([_Block("tool_use", input={
+                    "cleaned_text": "cleaned", "new_terms": []})])
+
+        class _Client:
+            messages = _Messages()
+
+        return _anthropic_cleaner(_Client()), captured
+
+    def _openai(self, first_error=None):
+        cleaner = Cleaner.__new__(Cleaner)
+        cleaner.cfg = _Config()
+        cleaner.provider = "openrouter"
+        cleaner._client = None
+        cleaner._api_key = "k"
+        calls = []
+
+        def post(body, timeout=None):
+            calls.append((body, timeout))
+            if first_error is not None and len(calls) == 1:
+                raise first_error
+            return {"choices": [{"finish_reason": "stop", "message": {
+                "content": '{"cleaned_text": "cleaned", "new_terms": []}'}}]}
+
+        cleaner._post_openai = post
+        return cleaner, calls
+
+    def test_anthropic_short_dictation_keeps_the_old_limits(self):
+        cleaner, captured = self._anthropic()
+        cleaner.clean(self.SHORT)
+        self.assertEqual(captured["max_tokens"], 2048)
+        self.assertEqual(captured["timeout"], 5.0)
+
+    def test_anthropic_long_dictation_scales_limits(self):
+        cleaner, captured = self._anthropic()
+        self.assertEqual(cleaner.clean(self.LONG).text, "cleaned")
+        self.assertEqual(captured["max_tokens"], 3000)  # 1200 words * 2.5
+        self.assertAlmostEqual(captured["timeout"], 23.0)  # 3 + 1200 / 60
+
+    def test_max_tokens_is_capped(self):
+        cleaner, captured = self._anthropic()
+        cleaner.clean(" ".join(["wort"] * 6000))
+        self.assertEqual(captured["max_tokens"], 8192)
+
+    def test_openai_short_dictation_keeps_the_old_limits(self):
+        cleaner, calls = self._openai()
+        cleaner.clean(self.SHORT)
+        body, timeout = calls[0]
+        self.assertEqual(body["max_tokens"], 2048)
+        self.assertEqual(timeout, 5.0)
+
+    def test_openai_long_dictation_scales_limits(self):
+        cleaner, calls = self._openai()
+        self.assertEqual(cleaner.clean(self.LONG).text, "cleaned")
+        body, timeout = calls[0]
+        self.assertEqual(body["max_tokens"], 3000)
+        self.assertAlmostEqual(timeout, 23.0)
+
+    def test_openai_plain_retry_keeps_the_scaled_limits(self):
+        import io
+        import urllib.error
+
+        error = urllib.error.HTTPError("u", 400, "bad", {}, io.BytesIO(b"no"))
+        cleaner, calls = self._openai(first_error=error)
+        cleaner.clean(self.LONG)
+        self.assertEqual(len(calls), 2)
+        body, timeout = calls[1]
+        self.assertNotIn("response_format", body)
+        self.assertEqual(body["max_tokens"], 3000)
+        self.assertAlmostEqual(timeout, 23.0)
+
+
 class TruncatedResponseTests(unittest.TestCase):
     """A response cut off at the token limit holds a *prefix* of the
     dictation. Because that prefix is non-empty, the `cleaned or text`
