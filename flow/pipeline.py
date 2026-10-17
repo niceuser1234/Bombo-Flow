@@ -532,7 +532,18 @@ class Pipeline:
                     self.set_state("idle")
 
     def _process_rewrite(self, captured, released_at):
-        """Rewrite mode: the recording is an instruction for the selection."""
+        """Rewrite mode: the recording is an instruction for the selection.
+
+        Never raises: the "Rewriting…" pill is persistent, so any failure must
+        replace it with a message rather than leave it on screen.
+        """
+        try:
+            self._rewrite(captured, released_at)
+        except Exception:
+            log.exception("Rewrite failed")
+            self.overlay.flash("Rewrite failed", 2.0)
+
+    def _rewrite(self, captured, released_at):
         instruction = self.engine.transcribe(captured).strip()
         log.info("Rewrite instruction (%.2fs): %d chars",
                  time.monotonic() - released_at, len(instruction))

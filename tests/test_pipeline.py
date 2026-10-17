@@ -986,6 +986,23 @@ class RewritePathTests(unittest.TestCase):
         self.p.cleaner.rewrite.assert_called_once_with("a b", "mach Stichpunkte")
         self.insert.assert_called_once_with("- a\n- b", mode="paste")
         self.assertEqual(self.store.add_dictation.call_args.kwargs["kind"], "rewrite")
+        args = self.store.add_dictation.call_args.args
+        self.assertEqual(args[0], "mach Stichpunkte")
+        self.assertEqual(args[1], "- a\n- b")
+
+    def test_grab_selection_raising_flashes_failure(self):
+        self.grab.side_effect = RuntimeError("boom")
+        self._run()
+        self.insert.assert_not_called()
+        self.assertIn(("Rewrite failed", 2.0), self.p.overlay.flashes)
+
+    def test_transcribe_raising_flashes_failure(self):
+        def boom(s, a, initial_prompt=None):
+            raise RuntimeError("boom")
+        self.p.engine = type("E", (), {"transcribe": boom})()
+        self._run()
+        self.insert.assert_not_called()
+        self.assertIn(("Rewrite failed", 2.0), self.p.overlay.flashes)
 
     def test_no_selection_pastes_nothing(self):
         self.grab.return_value = None
